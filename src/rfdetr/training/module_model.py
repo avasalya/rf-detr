@@ -632,7 +632,9 @@ class RFDETRModelModule(LightningModule):
         layout that no longer matches the live parameters.  Recasting same-shaped floating-point tensors here keeps the
         resumed optimizer compatible without discarding the saved momentum state.
         """
+        logger.info("TRAIN_START: entering on_train_start; configuring CUDA graph runner/optimizer state")
         self._configure_cuda_graph_runner()
+        logger.info("TRAIN_START: on_train_start configuration complete")
 
         if not self._use_fused_optimizer:
             return
@@ -760,6 +762,9 @@ class RFDETRModelModule(LightningModule):
             batch_idx: Index of the current batch within the epoch.
         """
         tc = self.train_config
+        logger.info("TRAIN_BATCH_START: epoch=%s batch=%d/%s targets=%d",
+                    self.current_epoch, batch_idx + 1,
+                    getattr(self.trainer, "num_training_batches", "?"), len(batch[1]))
         mc = self.model_config
 
         if tc.multi_scale is MultiScale.PER_BATCH:
@@ -819,6 +824,8 @@ class RFDETRModelModule(LightningModule):
             detached postprocessed predictions for train mAP logging.
         """
         samples, targets = batch
+        logger.info("TRAIN_FORWARD_START: epoch=%s batch=%d samples=%s",
+                    self.current_epoch, batch_idx + 1, tuple(samples.tensors.shape))
         batch_size = len(targets)
         if self._inductor_cudagraphs:
             # Lightning holds the logged loss tensors past this step. Marking the step lets cudagraph
@@ -830,6 +837,7 @@ class RFDETRModelModule(LightningModule):
             if self._cuda_graph_runner is not None
             else self.model(samples, targets)
         )
+        logger.info("TRAIN_FORWARD_DONE: epoch=%s batch=%d", self.current_epoch, batch_idx + 1)
         if self._use_manual_optimization:
             loss_dict, raw_loss, normalizer = self._compute_train_losses(outputs, targets)
             loss_for_backward = self._scale_loss_for_accumulation(raw_loss, normalizer)
@@ -838,6 +846,8 @@ class RFDETRModelModule(LightningModule):
             loss_for_backward = None
         weight_dict = self.criterion.weight_dict
         loss: Tensor = torch.stack([loss_dict[k] * weight_dict[k] for k in loss_dict if k in weight_dict]).sum()
+        logger.info("TRAIN_LOSS_DONE: epoch=%s batch=%d loss=%.6f",
+                    self.current_epoch, batch_idx + 1, float(loss.detach().cpu()))
         # Automatic optimization path: return the loss unscaled. Lightning divides the returned loss by
         # ``trainer.accumulate_grad_batches`` itself (``ClosureResult.from_training_step_output``) before
         # ``backward()``, so the accumulated gradient already equals the mean over the window; dividing here as

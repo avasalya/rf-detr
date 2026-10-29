@@ -386,12 +386,13 @@ def scale_coco_annotation(annotation: dict[str, Any], x_scale: float, y_scale: f
             [value * (x_scale if index % 2 == 0 else y_scale) for index, value in enumerate(polygon)]
             for polygon in segmentation
         ]
-    keypoints = scaled.get("keypoints")
-    if keypoints:
-        scaled["keypoints"] = [
-            value if index % 3 == 2 else value * (x_scale if index % 3 == 0 else y_scale)
-            for index, value in enumerate(keypoints)
-        ]
+    for keypoint_field in ("keypoints", "foot_kpts", "face_kpts", "lefthand_kpts", "righthand_kpts"):
+        keypoints = scaled.get(keypoint_field)
+        if keypoints:
+            scaled[keypoint_field] = [
+                value if index % 3 == 2 else value * (x_scale if index % 3 == 0 else y_scale)
+                for index, value in enumerate(keypoints)
+            ]
     return scaled
 
 
@@ -831,7 +832,14 @@ class ConvertCoco:
 
             keypoint_tensors: list[Tensor] = []
             for obj in anno:
+                # COCO-WholeBody stores the 133 joints in five separate fields:
+                # body (17), feet (6), face (68), left hand (21), right hand (21).
+                # Convert them to the single tensor expected by the RF-DETR loss.
                 raw_keypoints = obj.get("keypoints")
+                if any(field in obj for field in ("foot_kpts", "face_kpts", "lefthand_kpts", "righthand_kpts")):
+                    raw_keypoints = []
+                    for field in ("keypoints", "foot_kpts", "face_kpts", "lefthand_kpts", "righthand_kpts"):
+                        raw_keypoints.extend(obj.get(field, []))
                 if raw_keypoints is None:
                     keypoint_tensors.append(torch.zeros((num_keypoints, 3), dtype=torch.float32))
                     continue
@@ -1448,9 +1456,13 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
     # Detection dataset args may omit keypoint fields; default to the detection annotation path.
     has_keypoints = getattr(args, "use_grouppose_keypoints", False)
     mode = "person_keypoints" if has_keypoints else "instances"
+    wholebody_paths = {
+        "train": root / "annotations" / "coco_wholebody_train_v1.0.json",
+        "val": root / "annotations" / "coco_wholebody_val_v1.0.json",
+    }
     PATHS = {  # noqa: N806
-        "train": (root / "train2017", root / "annotations" / f"{mode}_train2017.json"),
-        "val": (root / "val2017", root / "annotations" / f"{mode}_val2017.json"),
+        "train": (root / "train2017", wholebody_paths["train"] if has_keypoints and wholebody_paths["train"].exists() else root / "annotations" / f"{mode}_train2017.json"),
+        "val": (root / "val2017", wholebody_paths["val"] if has_keypoints and wholebody_paths["val"].exists() else root / "annotations" / f"{mode}_val2017.json"),
         "test": (root / "test2017", root / "annotations" / "image_info_test-dev2017.json"),
     }
 
