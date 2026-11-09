@@ -382,7 +382,7 @@ def _append_training_callbacks(
                 every_n_epochs=1,
                 save_top_k=1,
                 save_on_train_epoch_end=True,
-                enable_version_counter=False,
+                enable_version_counter=True,
                 auto_insert_metric_name=False,
                 verbose=False,
             )
@@ -396,7 +396,7 @@ def _append_training_callbacks(
             every_n_epochs=tc.checkpoint_interval,
             save_top_k=-1,
             save_on_train_epoch_end=True,
-            enable_version_counter=False,
+            enable_version_counter=True,
             auto_insert_metric_name=False,
             verbose=False,
         )
