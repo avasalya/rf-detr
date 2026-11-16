@@ -85,6 +85,53 @@ class _GroupedKeypointCOCOeval:
     evals: list[COCOeval]
 
 
+#: COCO-WholeBody per-part keypoint fields after the 17 body ``keypoints``, with their keypoint counts.
+_WHOLEBODY_PART_FIELDS: tuple[tuple[str, int], ...] = (
+    ("foot_kpts", 6),
+    ("face_kpts", 68),
+    ("lefthand_kpts", 21),
+    ("righthand_kpts", 21),
+)
+
+
+def _merge_wholebody_keypoints(coco_gt: COCO) -> None:
+    """Concatenate COCO-WholeBody part fields into ``keypoints`` for whole-body OKS evaluation.
+
+    COCO-WholeBody stores only the 17 body joints in ``keypoints`` and the other 116 in separate part fields, so the
+    keypoint count would otherwise be inferred as 17. This mirrors the official evaluator (``myeval_wholebody.py``):
+    ground truth is body + foot + face + left hand + right hand, and a person is ignored only when none of those 133
+    keypoints is labelled, so ``num_keypoints`` is recounted over all of them. Part fields are popped, which makes the
+    merge idempotent when the same annotation dict is reachable from both ``dataset`` and ``anns``.
+
+    Args:
+        coco_gt: Ground-truth COCO object, mutated in place (callers pass a private copy).
+
+    Examples:
+        >>> from types import SimpleNamespace
+        >>> annotation = {"keypoints": [1, 1, 2] * 17, "foot_kpts": [0, 0, 0] * 6, "face_kpts": [2, 2, 1] * 68,
+        ...               "lefthand_kpts": [0, 0, 0] * 21, "righthand_kpts": [0, 0, 0] * 21, "num_keypoints": 17}
+        >>> gt = SimpleNamespace(dataset={"annotations": [annotation]}, anns={1: annotation})
+        >>> _merge_wholebody_keypoints(gt)
+        >>> len(annotation["keypoints"]) // 3, annotation["num_keypoints"], "face_kpts" in annotation
+        (133, 85, False)
+    """
+
+    def merge(annotation: dict[str, Any]) -> None:
+        if not any(field in annotation for field, _ in _WHOLEBODY_PART_FIELDS):
+            return
+        keypoints = list(annotation.get("keypoints") or [])
+        for field, count in _WHOLEBODY_PART_FIELDS:
+            part = list(annotation.pop(field, None) or [])[: 3 * count]
+            keypoints.extend(part + [0] * (3 * count - len(part)))
+        annotation["keypoints"] = keypoints
+        annotation["num_keypoints"] = sum(1 for visibility in keypoints[2::3] if visibility > 0)
+
+    for annotation in getattr(coco_gt, "dataset", {}).get("annotations", []):
+        merge(annotation)
+    for annotation in getattr(coco_gt, "anns", {}).values():
+        merge(annotation)
+
+
 def _ensure_faster_coco(coco_gt: Any) -> COCO:
     """Return a faster-coco-eval COCO object for evaluator construction."""
     if isinstance(coco_gt, COCO) and hasattr(coco_gt, "cat_img_map"):
@@ -374,6 +421,7 @@ class CocoEvaluator:
         resolved_keypoint_oks_sigmas = None
         keypoint_category_groups: list[_KeypointCategoryGroup] = []
         if "keypoints" in iou_types:
+            _merge_wholebody_keypoints(coco_gt)
             _backfill_num_keypoints(coco_gt)
             keypoint_category_groups = _build_keypoint_category_groups(coco_gt, keypoint_oks_sigmas)
             if len(keypoint_category_groups) <= 1:
