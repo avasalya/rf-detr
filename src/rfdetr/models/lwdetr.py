@@ -921,6 +921,7 @@ def build_criterion_and_postprocessors(args: "BuilderArgs") -> tuple[SetCriterio
             ia_bce_loss=args.ia_bce_loss,
             mask_point_sample_ratio=args.mask_point_sample_ratio,
             num_keypoints_per_class=getattr(args, "num_keypoints_per_class", []),
+            keypoint_loss_weights=getattr(args, "keypoint_loss_weights", None),
         )
     else:
         criterion = SetCriterion(
@@ -935,6 +936,7 @@ def build_criterion_and_postprocessors(args: "BuilderArgs") -> tuple[SetCriterio
             use_position_supervised_loss=args.use_position_supervised_loss,
             ia_bce_loss=args.ia_bce_loss,
             num_keypoints_per_class=getattr(args, "num_keypoints_per_class", []),
+            keypoint_loss_weights=getattr(args, "keypoint_loss_weights", None),
         )
     criterion.to(device)
     postprocess = PostProcess(

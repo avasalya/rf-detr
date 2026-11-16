@@ -8,6 +8,7 @@
 import functools
 import importlib
 import json
+import math
 import os
 import warnings
 from collections.abc import Callable, Mapping, Sequence
@@ -1283,6 +1284,9 @@ class TrainConfig(BaseConfig):
     keypoint_visible_loss_coef: float = 0
     keypoint_nll_loss_coef: float = 0
     keypoint_oks_sigmas: list[float] | None = None
+    # Per-keypoint loss weights (length = max keypoints per class). The keypoint loss becomes a weighted mean over
+    # each target's valid keypoints, so a group's share of the loss is set by its weights, not its keypoint count.
+    keypoint_loss_weights: list[float] | None = None
     # "webdataset" streams pre-packed tar shards instead of loose image files; see
     # rfdetr.datasets.webdataset for the packer and the sizing contract it imposes on the loaders.
     dataset_file: DatasetFile = "roboflow"
@@ -1587,6 +1591,14 @@ class TrainConfig(BaseConfig):
         """Validate smooth_alpha is in [0.0, 1.0)."""
         if not (0.0 <= v < 1.0):
             raise ValueError("smooth_alpha must be in [0.0, 1.0).")
+        return v
+
+    @field_validator("keypoint_loss_weights", mode="after")
+    @classmethod
+    def validate_keypoint_loss_weights(cls, v: list[float] | None) -> list[float] | None:
+        """Validate keypoint loss weights are non-empty, finite and positive."""
+        if v is not None and (not v or not all(math.isfinite(w) and w > 0 for w in v)):
+            raise ValueError("keypoint_loss_weights must be a non-empty list of positive finite numbers.")
         return v
 
     @field_validator("ema_update_interval", "eval_interval", mode="after")

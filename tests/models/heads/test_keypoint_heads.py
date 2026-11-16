@@ -569,3 +569,56 @@ class TestUnannotatedKeypoints:
 
         assert torch.allclose(masked[1], restricted[1])
         assert torch.allclose(masked[2], restricted[2])
+
+
+class TestKeypointLossWeights:
+    """``keypoint_weights`` turns each per-target keypoint mean into a weighted mean."""
+
+    @pytest.fixture
+    def inputs(self) -> dict:
+        torch.manual_seed(0)
+        target_keypoints = torch.rand(2, 6, 3)
+        target_keypoints[:, :, 2] = 2.0
+        return {
+            "all_pred_keypoints": torch.randn(2, 6, 7),
+            "target_keypoints": target_keypoints,
+            "target_classes": torch.zeros(2, dtype=torch.int64),
+            "target_areas": torch.tensor([1.0, 2.0]),
+            "num_keypoints_per_class": [6],
+        }
+
+    def test_uniform_weights_match_unweighted(self, inputs: dict) -> None:
+        unweighted = compute_l1_keypoint_loss(**inputs)
+        weighted = compute_l1_keypoint_loss(**inputs, keypoint_weights=torch.full((6,), 3.0))
+
+        for expected, actual in zip(unweighted, weighted):
+            assert torch.allclose(expected, actual)
+
+    def test_weights_are_scale_invariant(self, inputs: dict) -> None:
+        weights = torch.tensor([2.0, 2.0, 0.5, 0.5, 0.5, 0.5])
+        base = compute_l1_keypoint_loss(**inputs, keypoint_weights=weights)
+        scaled = compute_l1_keypoint_loss(**inputs, keypoint_weights=weights * 7.0)
+
+        for expected, actual in zip(base, scaled):
+            assert torch.allclose(expected, actual)
+
+    def test_location_loss_is_weighted_mean(self, inputs: dict) -> None:
+        weights = torch.tensor([3.0, 3.0, 1.0, 1.0, 1.0, 1.0])
+        location_loss = compute_l1_keypoint_loss(**inputs, keypoint_weights=weights)[0]
+
+        l1 = (inputs["all_pred_keypoints"][:, :, :2] - inputs["target_keypoints"][:, :, :2]).abs().sum(-1)
+        l1 = l1 / inputs["target_areas"].sqrt().unsqueeze(1)
+        expected = (l1 * weights).sum(-1) / weights.sum()
+        assert torch.allclose(location_loss, expected)
+
+    def test_unlabeled_group_drops_out_of_weighted_mean(self, inputs: dict) -> None:
+        inputs["target_keypoints"][:, :2, 2] = 0.0
+        weights = torch.tensor([100.0, 100.0, 1.0, 1.0, 1.0, 1.0])
+        weighted = compute_l1_keypoint_loss(**inputs, keypoint_weights=weights)[0]
+        unweighted = compute_l1_keypoint_loss(**inputs)[0]
+
+        assert torch.allclose(weighted, unweighted)
+
+    def test_rejects_wrong_weight_length(self, inputs: dict) -> None:
+        with pytest.raises(ValueError, match="keypoint_weights shape"):
+            compute_l1_keypoint_loss(**inputs, keypoint_weights=torch.ones(5))

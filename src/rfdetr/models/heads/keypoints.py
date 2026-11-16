@@ -126,12 +126,25 @@ class ConditionalQueryInitializer(nn.Module):
         return cast("Tensor", modulated_query_features)
 
 
+def _masked_mean(values: Tensor, mask: Tensor, count: Tensor, weights: Tensor | None) -> Tensor:
+    """Mean of already-masked ``values`` over ``mask`` per row, weighted by ``weights`` when given.
+
+    ``count`` is the clamped unweighted mask count, used unchanged on the uniform path so results stay bit-identical.
+    """
+    if weights is None:
+        return values.sum(-1) / count
+    w = weights.to(device=values.device, dtype=values.dtype)
+    weight_sum = (mask.to(values.dtype) * w).sum(-1)
+    return (values * w).sum(-1) / torch.where(weight_sum > 0, weight_sum, torch.ones_like(weight_sum))
+
+
 def compute_l1_keypoint_loss(
     all_pred_keypoints: Tensor,
     target_keypoints: Tensor,
     target_classes: Tensor,
     target_areas: Tensor,
     num_keypoints_per_class: Sequence[int],
+    keypoint_weights: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Compute the keypoint loss vector per matched target.
 
@@ -159,6 +172,10 @@ def compute_l1_keypoint_loss(
         target_classes: Class ids per target with shape ``(N,)``.
         target_areas: Target box areas with shape ``(N,)``.
         num_keypoints_per_class: Number of keypoints per class.
+        keypoint_weights: Optional per-keypoint-slot weights with shape ``(K_max,)``, shared by every class.
+            When given, each per-target mean over valid keypoints becomes a weighted mean, so the relative
+            weights set each keypoint group's share of the loss independently of its keypoint count. The
+            result is invariant to the overall scale of the weights. ``None`` keeps the uniform mean.
 
     Returns:
         Tuple of location, findable BCE, visible BCE, and raw Gaussian NLL losses.
@@ -232,6 +249,8 @@ def compute_l1_keypoint_loss(
             f" num_classes ({num_classes})"
         )
     kpad = total_padded_num_keypoints // num_classes
+    if keypoint_weights is not None and keypoint_weights.shape != (kpad,):
+        raise ValueError(f"keypoint_weights shape {tuple(keypoint_weights.shape)} must be ({kpad},).")
     split_pred_keypoints = all_pred_keypoints.view(n_targets, num_classes, kpad, pred_dim)
     selected_pred_keypoints = split_pred_keypoints[
         torch.arange(n_targets, device=split_pred_keypoints.device), target_classes
@@ -283,7 +302,7 @@ def compute_l1_keypoint_loss(
     safe_target_xy = torch.where(location_loss_mask.unsqueeze(-1), target_keypoints[:, :, :2], zeros_xy)
     l1_per_keypoint = F.l1_loss(safe_pred_xy, safe_target_xy, reduction="none").sum(-1)
     scaled_masked_l1 = l1_per_keypoint.masked_fill(~location_loss_mask, 0.0) / safe_area_sqrt.unsqueeze(1)
-    location_loss = scaled_masked_l1.sum(-1) / valid_count
+    location_loss = _masked_mean(scaled_masked_l1, location_loss_mask, valid_count, keypoint_weights)
 
     safe_pred_findable = torch.where(
         findable_loss_mask, selected_pred_keypoints[:, :, 2], torch.zeros_like(selected_pred_keypoints[:, :, 2])
@@ -293,7 +312,9 @@ def compute_l1_keypoint_loss(
         (target_keypoints[:, :, 2] > 0).to(selected_pred_keypoints.dtype),
         reduction="none",
     )
-    findable_loss = findable_bce.masked_fill(~findable_loss_mask, 0.0).sum(-1) / findable_count
+    findable_loss = _masked_mean(
+        findable_bce.masked_fill(~findable_loss_mask, 0.0), findable_loss_mask, findable_count, keypoint_weights
+    )
 
     safe_pred_visible = torch.where(
         visible_loss_mask, selected_pred_keypoints[:, :, 3], torch.zeros_like(selected_pred_keypoints[:, :, 3])
@@ -303,7 +324,9 @@ def compute_l1_keypoint_loss(
         (target_keypoints[:, :, 2] > 1).to(selected_pred_keypoints.dtype),
         reduction="none",
     )
-    visible_loss = visible_bce.masked_fill(~visible_loss_mask, 0.0).sum(-1) / visible_count
+    visible_loss = _masked_mean(
+        visible_bce.masked_fill(~visible_loss_mask, 0.0), visible_loss_mask, visible_count, keypoint_weights
+    )
 
     raw_log_l11 = selected_pred_keypoints[:, :, 4].to(torch.float32)
     raw_l21 = selected_pred_keypoints[:, :, 5].to(torch.float32)
@@ -370,7 +393,7 @@ def compute_l1_keypoint_loss(
         nll_raw, nan=0.0, posinf=torch.finfo(nll_raw.dtype).max / 2, neginf=torch.finfo(nll_raw.dtype).min
     )
     nll_keypoints = nll_raw.masked_fill(~gaussian_loss_mask, 0.0)
-    nll_loss = nll_keypoints.sum(-1) / gaussian_valid_count
+    nll_loss = _masked_mean(nll_keypoints, gaussian_loss_mask, gaussian_valid_count, keypoint_weights)
     no_valid = gaussian_count <= 0
     nll_loss = torch.where(no_valid, torch.zeros_like(nll_loss), nll_loss)
 

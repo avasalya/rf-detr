@@ -503,6 +503,7 @@ class SetCriterion(nn.Module):
         ia_bce_loss: bool = False,
         mask_point_sample_ratio: int = 16,
         num_keypoints_per_class: list[int] | None = None,
+        keypoint_loss_weights: list[float] | None = None,
     ) -> None:
         """Create the criterion.
 
@@ -513,6 +514,7 @@ class SetCriterion(nn.Module):
             losses: list of all the losses to be applied. See get_loss for list of available losses.
             focal_alpha: alpha in Focal Loss
             group_detr: Number of groups to speed detr training. Default is 1.
+            keypoint_loss_weights: optional per-keypoint weights; turns the keypoint loss into a weighted mean
         """
         super().__init__()
         self.num_classes = num_classes
@@ -527,6 +529,12 @@ class SetCriterion(nn.Module):
         self.ia_bce_loss = ia_bce_loss
         self.mask_point_sample_ratio = mask_point_sample_ratio
         self.num_keypoints_per_class = num_keypoints_per_class or []
+        self.keypoint_loss_weights: Tensor | None
+        self.register_buffer(
+            "keypoint_loss_weights",
+            torch.tensor(keypoint_loss_weights, dtype=torch.float32) if keypoint_loss_weights else None,
+            persistent=False,
+        )
         self._compile_batched_detection_losses = False
         self._compiled_batched_detection_losses: Callable[..., tuple[Tensor, Tensor, Tensor, Tensor]] | None = None
 
@@ -996,6 +1004,7 @@ class SetCriterion(nn.Module):
             target_classes=target_classes.to(src_keypoints.device),
             target_areas=target_areas.to(src_keypoints.device),
             num_keypoints_per_class=self.num_keypoints_per_class,
+            keypoint_weights=self.keypoint_loss_weights,
         )
 
         return {
