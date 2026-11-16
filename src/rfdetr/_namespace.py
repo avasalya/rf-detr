@@ -49,6 +49,8 @@ _MC_NAMESPACE_FIELDS = {
     "use_grouppose_keypoints",
     "keypoint_cross_attn",
     "inter_instance_kp_attn",
+    "keypoint_decoder",
+    "detrpose_across_topk",
     "grouppose_keypoint_dim_downscale",
     "dual_projector",
     "dual_projector_kp_only",

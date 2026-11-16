@@ -197,6 +197,11 @@ class LWDETR(nn.Module):
             nn.init.constant_(keypoint_out_layer.bias.data, 0)
         else:
             self.keypoint_embed = None
+        self.keypoint_decoder = getattr(self.transformer, "keypoint_decoder", "grouppose")
+        if self.keypoint_decoder == "detrpose" and self.keypoint_embed is not None:
+            # Share the keypoint head with the decoder for per-layer reference refinement. ``object.__setattr__``
+            # keeps it out of the decoder's ``_modules`` so no duplicate state-dict keys are created.
+            object.__setattr__(self.transformer.decoder, "_keypoint_head", self.keypoint_embed)
 
         self._kp_active_mask: Tensor
         self.register_buffer("_kp_active_mask", self._create_kp_active_mask(self.num_keypoints_per_class))
@@ -512,10 +517,13 @@ class LWDETR(nn.Module):
         )
         if self.use_grouppose_keypoints:
             hs, ref_unsigmoid, hs_enc, ref_enc, keypoint_hs, enc_kp_predictions = transformer_outputs[:6]
+            # detrpose: per-layer box-relative keypoint reference offsets, appended just before ``cls_ts``.
+            kp_ref_offsets = transformer_outputs[-2] if self.keypoint_decoder == "detrpose" else None
         else:
             hs, ref_unsigmoid, hs_enc, ref_enc = transformer_outputs[:4]
             keypoint_hs = None
             enc_kp_predictions = None
+            kp_ref_offsets = None
         # Last element: enc_out_class_embed's output at the two-stage selected positions, already
         # gathered by Transformer._two_stage_group_selection -- None on the rare fallback path
         # (custom/heterogeneous group modules), where the loop below still recomputes it.
@@ -547,7 +555,10 @@ class LWDETR(nn.Module):
                 outputs_keypoints_delta = torch.nan_to_num(outputs_keypoints_delta, nan=0.0, posinf=0.0, neginf=0.0)
                 ref_wh = ref_unsigmoid[..., 2:].unsqueeze(-2)
                 ref_xy = ref_unsigmoid[..., :2].unsqueeze(-2)
-                keypoints_xy = outputs_keypoints_delta[..., :2] * ref_wh + ref_xy
+                keypoints_delta_xy = outputs_keypoints_delta[..., :2]
+                if kp_ref_offsets is not None:
+                    keypoints_delta_xy = keypoints_delta_xy + kp_ref_offsets
+                keypoints_xy = keypoints_delta_xy * ref_wh + ref_xy
                 keypoints_other = outputs_keypoints_delta[..., 2:]
                 outputs_keypoints_compact = torch.cat([keypoints_xy, keypoints_other], dim=-1)
 

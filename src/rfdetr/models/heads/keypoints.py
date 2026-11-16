@@ -648,8 +648,28 @@ def compute_keypoint_matching_cost(
     return cost_l1, cost_findable, cost_visible, cost_nll
 
 
+class KeypointGate(nn.Module):
+    """DETRPose-style gated fusion of a residual stream ``x1`` with a cross-attention update ``x2``.
+
+    ``out = LayerNorm(g1 * x1 + g2 * x2)`` with ``[g1, g2] = sigmoid(Linear([x1, x2]))``. Zero weights and zero bias
+    start both gates at 0.5, i.e. a scaled residual ``0.5 * (x1 + x2)`` before normalisation.
+    """
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.gate = nn.Linear(2 * dim, 2 * dim)
+        nn.init.constant_(self.gate.weight, 0.0)
+        nn.init.constant_(self.gate.bias, 0.0)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x1: Tensor, x2: Tensor) -> Tensor:
+        gate1, gate2 = torch.sigmoid(self.gate(torch.cat([x1, x2], dim=-1))).chunk(2, dim=-1)
+        return cast(Tensor, self.norm(gate1 * x1 + gate2 * x2))
+
+
 __all__ = [
     "ConditionalQueryInitializer",
+    "KeypointGate",
     "compute_keypoint_matching_cost",
     "compute_l1_keypoint_loss",
 ]

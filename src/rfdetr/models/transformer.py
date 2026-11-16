@@ -26,7 +26,7 @@ import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
 from rfdetr.models._types import BuilderArgs
-from rfdetr.models.heads.keypoints import ConditionalQueryInitializer
+from rfdetr.models.heads.keypoints import ConditionalQueryInitializer, KeypointGate
 from rfdetr.models.math import MLP
 from rfdetr.models.ops.modules import MSDeformAttn
 from rfdetr.utilities.compiler import is_compiling
@@ -259,6 +259,8 @@ class Transformer(nn.Module):
         grouppose_keypoint_dim_downscale: int = 1,
         keypoint_cross_attn: bool = True,
         inter_instance_kp_attn: bool = False,
+        keypoint_decoder: str = "grouppose",
+        detrpose_across_topk: int = 100,
         num_registers: int = 0,
         dual_projector_kp_only: bool = False,
     ) -> None:
@@ -272,6 +274,11 @@ class Transformer(nn.Module):
         self.dual_projector_kp_only = dual_projector_kp_only
         self.num_keypoints_per_class = num_keypoints_per_class or []
         self.num_registers = num_registers
+        if keypoint_decoder not in ("grouppose", "detrpose"):
+            raise ValueError(f"keypoint_decoder must be 'grouppose' or 'detrpose', got {keypoint_decoder!r}")
+        if keypoint_decoder == "detrpose" and use_grouppose_keypoints and not (two_stage and bbox_reparam):
+            raise ValueError("keypoint_decoder='detrpose' requires two_stage=True and bbox_reparam=True")
+        self.keypoint_decoder = keypoint_decoder
 
         decoder_layer = TransformerDecoderLayer(
             d_model,
@@ -289,6 +296,8 @@ class Transformer(nn.Module):
             grouppose_keypoint_dim_downscale=grouppose_keypoint_dim_downscale,
             keypoint_cross_attn=keypoint_cross_attn,
             inter_instance_kp_attn=inter_instance_kp_attn,
+            keypoint_decoder=keypoint_decoder,
+            detrpose_across_topk=detrpose_across_topk,
         )
         assert decoder_norm_type in ["LN", "Identity"]
         norm_ctors: dict[str, Callable[[int], nn.Module]] = {
@@ -308,6 +317,7 @@ class Transformer(nn.Module):
             enable_keypoint_processing=use_grouppose_keypoints,
             num_keypoints_per_class=self.num_keypoints_per_class,
             grouppose_keypoint_dim_downscale=grouppose_keypoint_dim_downscale,
+            keypoint_decoder=keypoint_decoder,
         )
 
         self.two_stage = two_stage
@@ -902,8 +912,11 @@ class Transformer(nn.Module):
                 kp_cross_attn_memory=kp_cross_attn_memory,
             )
 
+            kp_ref_offsets = None
             if self.use_grouppose_keypoints and len(decoder_outputs) > 2:
                 hs, references, keypoint_hs = decoder_outputs[:3]
+                if self.keypoint_decoder == "detrpose":
+                    kp_ref_offsets = decoder_outputs[3]
             else:
                 hs, references = decoder_outputs[:2]
                 keypoint_hs = None
@@ -925,11 +938,17 @@ class Transformer(nn.Module):
                         [c[:, :, :original_num_queries_per_group] for c in keypoint_hs.split(n_with_reg, dim=2)],
                         dim=2,
                     )
+                if kp_ref_offsets is not None:
+                    kp_ref_offsets = torch.cat(
+                        [c[:, :, :original_num_queries_per_group] for c in kp_ref_offsets.split(n_with_reg, dim=2)],
+                        dim=2,
+                    )
         else:
             assert self.two_stage, "if not using decoder, two_stage must be True"
             hs = None
             references = None
             keypoint_hs = None
+            kp_ref_offsets = None
 
         return_values = [hs, references]
         if self.two_stage:
@@ -945,6 +964,10 @@ class Transformer(nn.Module):
             return_values.append(keypoint_hs)
             return_values.append(enc_kp_predictions)
             return_values.append(keypoint_memory_ts if self.two_stage else None)
+            if self.keypoint_decoder == "detrpose":
+                # Per-layer box-relative keypoint reference offsets ``[L, B, N, K, 2]`` (detached); LWDETR adds them to
+                # the keypoint head's xy delta. Kept directly before ``cls_ts`` so existing slices stay valid.
+                return_values.append(kp_ref_offsets)
 
         # Always last: callers that need it grab it by position ([-1] or an explicit slice), so this
         # append must never move without updating every unpacking site (LWDETR.forward, forward_export).
@@ -968,9 +991,11 @@ class TransformerDecoder(nn.Module):
         enable_keypoint_processing: bool = False,
         num_keypoints_per_class: list[int] | None = None,
         grouppose_keypoint_dim_downscale: int = 1,
+        keypoint_decoder: str = "grouppose",
     ) -> None:
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
+        self.keypoint_decoder = keypoint_decoder
         self.num_layers = num_layers
         self.d_model = d_model
         self.norm = norm
@@ -991,6 +1016,13 @@ class TransformerDecoder(nn.Module):
             kp_dim = d_model // grouppose_keypoint_dim_downscale
             self.keypoint_pos_embed = nn.Parameter(torch.randn(sum(num_keypoints_per_class), kp_dim))
             self._create_keypoint_class_mask()
+        self.kp_ref_point_head: MLP | None = None
+        if enable_keypoint_processing and keypoint_decoder == "detrpose":
+            # Sine(xy) of each keypoint / pose-centre reference -> positional query, as in DETRPose.
+            self.kp_ref_point_head = MLP(d_model, d_model, d_model // grouppose_keypoint_dim_downscale, 2)
+        # detrpose: LWDETR injects its shared ``keypoint_embed`` here (plain attribute, not a registered submodule, so
+        # the state-dict layout is unchanged) to refine per-layer keypoint reference points.
+        self._keypoint_head: nn.Module | None = None
         self._export = False
 
     def export(self) -> None:
@@ -1024,6 +1056,38 @@ class TransformerDecoder(nn.Module):
         else:
             self.register_buffer("keypoint_class_mask", mask, persistent=True)
         return cast(Tensor, self.keypoint_class_mask)
+
+    def _detrpose_keypoint_references(
+        self, kp_ref_offset: Tensor, obj_center: Tensor, valid_ratios: Tensor, kp_identity_pos: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """Build DETRPose-style positional queries and deformable reference points for ``[inst + K kp]`` tokens.
+
+        Keypoint tokens are referenced at their own current location, the instance slot at the pose centre; all
+        tokens reuse the box ``wh`` so the deformable sampling spread scales with the instance.
+
+        Args:
+            kp_ref_offset: Box-relative keypoint offsets ``[B, N, K, 2]``.
+            obj_center: Box references ``(cx, cy, w, h)`` ``[B, N, 4]``.
+            valid_ratios: Per-level valid ratios ``[B, L, 2]``.
+            kp_identity_pos: Learned per-keypoint embedding ``[B, N, K, C]``.
+
+        Returns:
+            ``(pos, reference_points)``: ``pos`` ``[B, N, 1 + K, C]`` (slot 0 = instance / pose centre) and
+            ``reference_points`` ``[B, N * (1 + K), L, 4]`` for ``MSDeformAttn``.
+        """
+        assert self.kp_ref_point_head is not None
+        bs, num_queries, _num_kp, _ = kp_ref_offset.shape
+        box_xy = obj_center[..., None, :2]
+        box_wh = obj_center[..., None, 2:]
+        kp_xy = kp_ref_offset * box_wh + box_xy
+        points = torch.cat([kp_xy.mean(dim=2, keepdim=True), kp_xy], dim=2)  # [B, N, 1 + K, 2]
+        num_tokens = points.shape[2]
+        ref = torch.cat([points, box_wh.expand(-1, -1, num_tokens, -1)], dim=-1)  # [B, N, 1 + K, 4]
+        ref = ref[:, :, :, None] * torch.cat([valid_ratios, valid_ratios], -1)[:, None, None]  # [B, N, 1+K, L, 4]
+        sine = gen_sineembed_for_position(ref[:, :, :, 0, :2].flatten(1, 2), self.d_model // 2)
+        pos = self.kp_ref_point_head(sine).view(bs, num_queries, num_tokens, -1)
+        pos = torch.cat([pos[:, :, :1], pos[:, :, 1:] + kp_identity_pos], dim=2)
+        return pos, ref.flatten(1, 2)
 
     def refpoints_refine(self, refpoints_unsigmoid: Tensor, new_refpoints_delta: Tensor) -> Tensor:
         if self.bbox_reparam:
@@ -1106,7 +1170,27 @@ class TransformerDecoder(nn.Module):
             else:
                 obj_center, refpoints_input, query_pos, _query_sine_embed = get_reference(refpoints_unsigmoid.sigmoid())
 
+        detrpose = self.enable_keypoint_processing and self.keypoint_decoder == "detrpose"
+        kp_ref_offset = None
+        intermediate_kp_ref_offsets = []
+        if detrpose:
+            if self._export:
+                raise NotImplementedError("keypoint_decoder='detrpose' does not support export yet")
+            if self._keypoint_head is None or self.kp_ref_point_head is None:
+                raise ValueError("keypoint_decoder='detrpose' requires LWDETR to inject the keypoint head")
+            assert init_kp_ref_xy is not None and valid_ratios is not None
+            # Box-relative keypoint offsets: keypoint_xy = offset * box_wh + box_cxcy (same parametrisation as the head).
+            box_xy = obj_center[..., None, :2]
+            box_wh = obj_center[..., None, 2:].clamp(min=1e-4)
+            kp_ref_offset = ((init_kp_ref_xy - box_xy) / box_wh).detach()
+
         for layer_id, layer in enumerate(self.layers):
+            kp_reference_points = None
+            if detrpose:
+                assert kp_ref_offset is not None and keypoint_tgt is not None and kp_query_pos is not None
+                kp_query_pos_layer, kp_reference_points = self._detrpose_keypoint_references(
+                    kp_ref_offset, obj_center, cast(Tensor, valid_ratios), kp_query_pos
+                )
             if not self.lite_refpoint_refine:
                 if self.bbox_reparam:
                     obj_center, refpoints_input, query_pos, _query_sine_embed = get_reference(refpoints_unsigmoid)
@@ -1129,12 +1213,21 @@ class TransformerDecoder(nn.Module):
                     spatial_shapes_hw=spatial_shapes_hw,
                     level_start_index=level_start_index,
                     keypoint_tgt=keypoint_tgt,
-                    keypoint_pos=kp_query_pos,
+                    keypoint_pos=kp_query_pos_layer if detrpose else kp_query_pos,
                     keypoint_class_mask=self.keypoint_class_mask,
                     kp_cross_attn_memory=kp_cross_attn_memory,
+                    kp_reference_points=kp_reference_points,
                 )
                 output, keypoint_tgt = layer_outputs
                 intermediate_keypoints.append(keypoint_tgt)
+                if detrpose:
+                    assert kp_ref_offset is not None and self._keypoint_head is not None
+                    intermediate_kp_ref_offsets.append(kp_ref_offset)
+                    if layer_id < self.num_layers - 1:
+                        # Iterative refinement (DETRPose / DINO style): next layer's reference = this layer's
+                        # prediction, detached so each layer's loss only trains its own delta.
+                        kp_delta = torch.nan_to_num(self._keypoint_head(keypoint_tgt)[..., :2], nan=0.0, posinf=0.0, neginf=0.0)
+                        kp_ref_offset = (kp_ref_offset + kp_delta).detach()
             else:
                 output = layer(
                     output,
@@ -1190,6 +1283,8 @@ class TransformerDecoder(nn.Module):
 
             if self.enable_keypoint_processing:
                 results.append(torch.stack(intermediate_keypoints))
+                if detrpose:
+                    results.append(torch.stack(intermediate_kp_ref_offsets))
 
             return tuple(results)
 
@@ -1216,8 +1311,15 @@ class TransformerDecoderLayer(nn.Module):
         grouppose_keypoint_dim_downscale: int = 1,
         keypoint_cross_attn: bool = True,
         inter_instance_kp_attn: bool = False,
+        keypoint_decoder: str = "grouppose",
+        detrpose_across_topk: int = 100,
     ) -> None:
         super().__init__()
+        self.keypoint_decoder = keypoint_decoder
+        self.detrpose_across_topk = detrpose_across_topk
+        if enable_keypoint_processing and keypoint_decoder == "detrpose":
+            # DETRPose always runs keypoint deformable cross-attention; across-instance attention follows the flag.
+            keypoint_cross_attn = True
         # Decoder Self-Attention
         self.self_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=sa_nhead, dropout=dropout, batch_first=True)
         self.dropout1 = nn.Dropout(dropout)
@@ -1289,7 +1391,8 @@ class TransformerDecoderLayer(nn.Module):
                     n_points=dec_n_points,
                 )
                 self.kp_cross_attn_dropout = nn.Dropout(dropout)
-                self.kp_cross_attn_norm = nn.LayerNorm(kp_dim)
+                if keypoint_decoder != "detrpose":  # detrpose fuses through ``kp_gate`` (which has its own norm)
+                    self.kp_cross_attn_norm = nn.LayerNorm(kp_dim)
 
             self.kp_linear1 = nn.Linear(kp_dim, d_model * 4 // grouppose_keypoint_dim_downscale)
             self.kp_dropout2 = nn.Dropout(dropout)
@@ -1298,10 +1401,100 @@ class TransformerDecoderLayer(nn.Module):
             self.kp_norm5 = nn.LayerNorm(kp_dim)
 
             self.instance_kp_layer_scale = nn.Parameter(torch.ones(1) * 1e-6)
+            if keypoint_decoder == "detrpose":
+                self.kp_gate = KeypointGate(kp_dim)
         self._export = False
 
     def with_pos_embed(self, tensor: Tensor, pos: Tensor | None) -> Tensor:
         return tensor if pos is None else tensor + pos
+
+    def _detrpose_keypoint_block(
+        self,
+        tgt: Tensor,
+        query_pos: Tensor | None,
+        keypoint_tgt: Tensor,
+        keypoint_pos: Tensor,
+        keypoint_class_mask: Tensor | None,
+        kp_reference_points: Tensor,
+        kp_memory: Tensor,
+        spatial_shapes: Tensor | None,
+        spatial_shapes_hw: list[tuple[int, int]] | None,
+        level_start_index: Tensor | None,
+        memory_key_padding_mask: Tensor | None,
+    ) -> tuple[Tensor, Tensor]:
+        """DETRPose-style keypoint block run after the (unchanged) RF-DETR instance/box path.
+
+        Tokens are ``[inst + K kp]`` per query; slot 0 is the projected instance query. Order: within-instance
+        self-attention -> across-instance attention (same keypoint index, per query group) -> per-token deformable
+        cross-attention (keypoints at their own location, instance at the pose centre, box ``wh`` as spread) ->
+        gated fusion -> FFN. The instance slot is fed back into the box stream through ``instance_kp_layer_scale``.
+
+        Args:
+            tgt: Instance queries after self/cross-attn/FFN ``[B, N, D]``.
+            query_pos: Instance positional query ``[B, N, D]``.
+            keypoint_tgt: Keypoint queries ``[B, N, K, C]``.
+            keypoint_pos: Positional queries for ``[inst + K kp]`` ``[B, N, 1 + K, C]``.
+            keypoint_class_mask: Boolean mask blocking cross-class keypoint attention ``[1 + K, 1 + K]``.
+            kp_reference_points: Deformable reference points ``[B, N * (1 + K), L, 4]``.
+            kp_memory: Memory used for keypoint cross-attention ``[B, S, D]``.
+            spatial_shapes: Per-level spatial shapes.
+            spatial_shapes_hw: Per-level ``(H, W)`` Python ints.
+            level_start_index: Per-level start offsets in ``kp_memory``.
+            memory_key_padding_mask: Padding mask for ``kp_memory``.
+
+        Returns:
+            Updated ``(tgt, keypoint_tgt)``.
+        """
+        bs, num_queries, num_kp, kp_dim = keypoint_tgt.shape
+        num_tokens = 1 + num_kp
+        inst_pos = self.inst_pos_in_proj(query_pos) if query_pos is not None else torch.zeros_like(keypoint_tgt[:, :, 0])
+        # Instance-path positional features are shared by every token of the instance.
+        pos = keypoint_pos + inst_pos.unsqueeze(2)
+        tokens = torch.cat([self.inst_in_proj(tgt).unsqueeze(2), keypoint_tgt], dim=2)  # [B, N, 1 + K, C]
+
+        # Within-instance self-attention.
+        q = (tokens + pos).flatten(0, 1)
+        out = self.kp_inst_self_attn(
+            q, q, tokens.flatten(0, 1), attn_mask=_additive_attn_mask(keypoint_class_mask, q.dtype), need_weights=False
+        )[0]
+        tokens = self.kp_norm(tokens + self.kp_dropout(out.view(bs, num_queries, num_tokens, kp_dim)))
+
+        # Across-instance attention: each token index attends to the same index of the other queries in its own
+        # group, restricted to the first ``detrpose_across_topk`` queries of the group. Two-stage proposals are
+        # ``torch.topk``-sorted by encoder score, so these are the highest-scoring candidates; the rest (and the
+        # register tokens appended at each group's end) skip this sub-block unchanged.
+        if self.inter_instance_kp_attn:
+            groups = self.group_detr if self.training else 1
+            per_group = num_queries // groups
+            k = per_group if self.detrpose_across_topk <= 0 else min(self.detrpose_across_topk, per_group)
+            tokens_g = tokens.view(bs, groups, per_group, num_tokens, kp_dim)
+            sel = tokens_g[:, :, :k].permute(0, 1, 3, 2, 4).reshape(bs * groups * num_tokens, k, kp_dim)
+            sel_pos = pos.view(bs, groups, per_group, num_tokens, kp_dim)[:, :, :k]
+            sel_pos = sel_pos.permute(0, 1, 3, 2, 4).reshape(bs * groups * num_tokens, k, kp_dim)
+            q = sel + sel_pos
+            out = self.inter_inst_kp_attn(q, q, sel, need_weights=False)[0]
+            sel = self.inter_inst_kp_norm(sel + self.inter_inst_kp_dropout(out))
+            sel = sel.view(bs, groups, num_tokens, k, kp_dim).permute(0, 1, 3, 2, 4)
+            tokens = torch.cat([sel, tokens_g[:, :, k:]], dim=2).reshape(bs, num_queries, num_tokens, kp_dim)
+
+        # Per-token deformable cross-attention + gated fusion.
+        out = self.kp_cross_attn(
+            (tokens + pos).reshape(bs, num_queries * num_tokens, kp_dim),
+            kp_reference_points,
+            self.memory_in_proj(kp_memory),
+            spatial_shapes,
+            level_start_index,
+            memory_key_padding_mask,
+            input_spatial_shapes_hw=spatial_shapes_hw,
+        ).reshape(bs, num_queries, num_tokens, kp_dim)
+        tokens = self.kp_gate(tokens, self.kp_cross_attn_dropout(out))
+
+        # FFN.
+        tokens = tokens + self.kp_dropout4(self.kp_linear3(self.kp_dropout2(self.activation(self.kp_linear1(tokens)))))
+        tokens = self.kp_norm5(tokens)
+
+        tgt = self.kp_inst_norm(tgt + self.kp_inst_dropout(self.inst_out_proj(tokens[:, :, 0])) * self.instance_kp_layer_scale)
+        return tgt, tokens[:, :, 1:]
 
     def forward_post(
         self,
@@ -1321,6 +1514,7 @@ class TransformerDecoderLayer(nn.Module):
         keypoint_pos: Tensor | None = None,  # [B, N, total_kp_per_instance, C]
         keypoint_class_mask: Tensor | None = None,  # [1 + K, 1 + K]
         kp_cross_attn_memory: Tensor | None = None,
+        kp_reference_points: Tensor | None = None,  # detrpose: [B, N * (1 + K), L, 4]
     ) -> Tensor | tuple[Tensor, ...]:
         bs, num_queries, _ = tgt.shape
 
@@ -1366,6 +1560,23 @@ class TransformerDecoderLayer(nn.Module):
                 raise ValueError("Keypoint processing is enabled but keypoint_tgt/keypoint_pos missing")
             if reference_points is None:
                 raise ValueError("Keypoint processing is enabled but reference_points missing")
+
+            if self.keypoint_decoder == "detrpose":
+                if kp_reference_points is None:
+                    raise ValueError("keypoint_decoder='detrpose' requires kp_reference_points")
+                return self._detrpose_keypoint_block(
+                    tgt,
+                    query_pos,
+                    keypoint_tgt,
+                    keypoint_pos,
+                    keypoint_class_mask,
+                    kp_reference_points,
+                    kp_cross_attn_memory if kp_cross_attn_memory is not None else memory,
+                    spatial_shapes,
+                    spatial_shapes_hw,
+                    level_start_index,
+                    memory_key_padding_mask,
+                )
 
             tgt_for_kp = self.inst_in_proj(tgt)
             tgt_for_kp_pos = self.inst_pos_in_proj(query_pos)
@@ -1480,6 +1691,7 @@ class TransformerDecoderLayer(nn.Module):
         keypoint_pos: Tensor | None = None,
         keypoint_class_mask: Tensor | None = None,
         kp_cross_attn_memory: Tensor | None = None,
+        kp_reference_points: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, ...]:
         return self.forward_post(
             tgt,
@@ -1497,6 +1709,7 @@ class TransformerDecoderLayer(nn.Module):
             keypoint_pos=keypoint_pos,
             keypoint_class_mask=keypoint_class_mask,
             kp_cross_attn_memory=kp_cross_attn_memory,
+            kp_reference_points=kp_reference_points,
         )
 
 
@@ -1529,6 +1742,8 @@ def build_transformer(args: BuilderArgs) -> Transformer:
         grouppose_keypoint_dim_downscale=getattr(args, "grouppose_keypoint_dim_downscale", 1),
         keypoint_cross_attn=getattr(args, "keypoint_cross_attn", True),
         inter_instance_kp_attn=getattr(args, "inter_instance_kp_attn", False),
+        keypoint_decoder=getattr(args, "keypoint_decoder", "grouppose"),
+        detrpose_across_topk=getattr(args, "detrpose_across_topk", 100),
         num_registers=getattr(args, "num_decoder_registers", 0),
         dual_projector_kp_only=getattr(args, "dual_projector_kp_only", False),
     )

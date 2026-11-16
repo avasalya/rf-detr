@@ -41,6 +41,8 @@ class BuilderArgs(Protocol):
     use_grouppose_keypoints: bool
     keypoint_cross_attn: bool
     inter_instance_kp_attn: bool
+    keypoint_decoder: str
+    detrpose_across_topk: int
     grouppose_keypoint_dim_downscale: int
     dual_projector: bool
     dual_projector_kp_only: bool

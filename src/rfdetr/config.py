@@ -729,6 +729,10 @@ class ModelConfig(BaseConfig):
     use_grouppose_keypoints: bool = False
     keypoint_cross_attn: bool = True
     inter_instance_kp_attn: bool = False
+    keypoint_decoder: Literal["grouppose", "detrpose"] = "grouppose"
+    # detrpose only: across-instance keypoint attention runs over the top-k queries of each group (two-stage
+    # proposals are score-sorted); remaining queries skip it. ``0`` means all queries.
+    detrpose_across_topk: int = 100
     grouppose_keypoint_dim_downscale: int = 1
     dual_projector: bool = False
     dual_projector_kp_only: bool = False
