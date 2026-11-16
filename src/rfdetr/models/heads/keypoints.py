@@ -17,6 +17,10 @@ Slot index        Name         Meaning
 ``4`` – ``6``     ``L_*``      Lower-triangular Cholesky parameters ``Lxx``, ``Lxy``, ``Lyy``.
 ``7``             ``class``    Per-keypoint class-logit contribution aggregated into detection-class logits.
 ================  ===========  ==========================================================
+
+Target visibility ``v``: ``2`` visible, ``1`` labeled but occluded, ``0`` annotated as not findable (a negative for the
+findable/visible logits), ``< 0`` not annotated by the source dataset (excluded from every keypoint loss and matching
+term). ``v < 0`` lets datasets that cover only part of the keypoint schema be mixed without teaching "not findable".
 """
 
 from __future__ import annotations
@@ -248,11 +252,14 @@ def compute_l1_keypoint_loss(
     location_loss_mask = keypoints_loss_mask & valid_visibility & valid_xy & valid_area.unsqueeze(1)
     location_count = location_loss_mask.sum(-1).to(dtype=selected_pred_keypoints.dtype)
     valid_count = location_count.clamp(min=1)
+    # v < 0 marks a slot the source dataset never annotated: it is unknown, not a "not findable" negative, so it is
+    # excluded from the findable/visible BCE as well (v == 0 stays a negative there).
+    annotated = torch.isfinite(target_keypoints[:, :, 2]) & (target_keypoints[:, :, 2] >= 0)
     valid_findable = torch.isfinite(selected_pred_keypoints[:, :, 2])
-    findable_loss_mask = keypoints_loss_mask & valid_findable
+    findable_loss_mask = keypoints_loss_mask & valid_findable & annotated
     findable_count = findable_loss_mask.sum(-1).clamp(min=1).to(dtype=selected_pred_keypoints.dtype)
     valid_visible_pred = torch.isfinite(selected_pred_keypoints[:, :, 3])
-    visible_loss_mask = keypoints_loss_mask & valid_visible_pred
+    visible_loss_mask = keypoints_loss_mask & valid_visible_pred & annotated
     visible_count = visible_loss_mask.sum(-1).clamp(min=1).to(dtype=selected_pred_keypoints.dtype)
     # A non-finite ``area`` (e.g. a degenerate target box) is excluded from ``location_loss_mask`` via
     # ``valid_area`` above, but ``location_loss``/``nll_raw`` both still divide by this value directly --
@@ -372,12 +379,24 @@ def compute_l1_keypoint_loss(
     return location_loss, findable_loss, visible_loss, nll_loss
 
 
-def _cdist_bce_with_logits(x: Tensor, y: Tensor) -> Tensor:
-    """Compute pairwise BCE-with-logits summed along the last dim."""
+def _cdist_bce_with_logits(x: Tensor, y: Tensor, mask: Tensor | None = None) -> Tensor:
+    """Compute pairwise BCE-with-logits summed along the last dim.
+
+    Args:
+        x: Prediction logits of shape ``(P, K)``.
+        y: Binary targets of shape ``(T, K)``.
+        mask: Optional ``(T, K)`` mask; only masked-in target slots contribute to the sum.
+
+    Returns:
+        Pairwise cost of shape ``(P, T)``.
+    """
     y_float = y.to(dtype=x.dtype)
-    softplus = F.softplus(x).sum(dim=1, keepdim=True)
-    dot = torch.matmul(x, y_float.t())
-    return softplus - dot
+    if mask is None:
+        softplus = F.softplus(x).sum(dim=1, keepdim=True)
+        dot = torch.matmul(x, y_float.t())
+        return softplus - dot
+    mask_float = mask.to(dtype=x.dtype)
+    return torch.matmul(F.softplus(x), mask_float.t()) - torch.matmul(x, (y_float * mask_float).t())
 
 
 def compute_keypoint_matching_cost(
@@ -582,16 +601,24 @@ def compute_keypoint_matching_cost(
                 num_kpts,
             )
         )
-        cost_findable[:, :, target_indices] = _cdist_bce_with_logits(pred_findable, target_findable).reshape(
+        # Same "not annotated" (v < 0) exclusion as compute_l1_keypoint_loss, normalized per target by its annotated
+        # slot count; identical to the previous `/ num_kpts` when every slot is annotated.
+        annotated = torch.isfinite(target_by_class[:, :, 2]) & (target_by_class[:, :, 2] >= 0)
+        annotated_count = annotated.sum(-1).clamp(min=1).to(all_pred_keypoints.dtype).unsqueeze(0)
+        cost_findable[:, :, target_indices] = (
+            _cdist_bce_with_logits(pred_findable, target_findable, annotated) / annotated_count
+        ).reshape(
             b,
             num_queries,
             n_targets_by_class,
-        ) / float(num_kpts)
-        cost_visible[:, :, target_indices] = _cdist_bce_with_logits(pred_visible, target_visible).reshape(
+        )
+        cost_visible[:, :, target_indices] = (
+            _cdist_bce_with_logits(pred_visible, target_visible, annotated) / annotated_count
+        ).reshape(
             b,
             num_queries,
             n_targets_by_class,
-        ) / float(num_kpts)
+        )
 
     # NaN/Inf protection is upstream (see ``nan_to_num`` calls earlier); per-step
     # matching-cost assertions removed for performance (5–15% step latency).

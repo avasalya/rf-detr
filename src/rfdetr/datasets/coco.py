@@ -840,17 +840,28 @@ class ConvertCoco:
                     raw_keypoints = []
                     for field in ("keypoints", "foot_kpts", "face_kpts", "lefthand_kpts", "righthand_kpts"):
                         raw_keypoints.extend(obj.get(field, []))
+                # Slots the annotation does not cover are marked "not annotated" (v = -1), not v = 0: the keypoint
+                # loss treats v = 0 as a negative ("annotator could not find it") for the findable/visible heads,
+                # while v < 0 is excluded from every keypoint term. See models/heads/keypoints.py.
+                unannotated = torch.tensor([0.0, 0.0, -1.0])
                 if raw_keypoints is None:
-                    keypoint_tensors.append(torch.zeros((num_keypoints, 3), dtype=torch.float32))
+                    keypoint_tensors.append(unannotated.repeat(num_keypoints, 1))
                     continue
 
                 keypoint_tensor = torch.as_tensor(raw_keypoints, dtype=torch.float32).reshape(-1, 3)
                 if keypoint_tensor.shape[0] < num_keypoints:
-                    padded = torch.zeros((num_keypoints, 3), dtype=torch.float32)
+                    padded = unannotated.repeat(num_keypoints, 1)
                     padded[: keypoint_tensor.shape[0]] = keypoint_tensor
-                    keypoint_tensors.append(padded)
-                    continue
-                keypoint_tensors.append(keypoint_tensor[:num_keypoints])
+                    keypoint_tensor = padded
+                keypoint_tensor = keypoint_tensor[:num_keypoints]
+                # Optional per-keypoint annotation mask (merged multi-dataset files): 0 = not annotated.
+                annotated = obj.get("kpt_annotated")
+                if annotated is not None:
+                    annotated_mask = torch.zeros(num_keypoints, dtype=torch.bool)
+                    annotated_tensor = torch.as_tensor(annotated, dtype=torch.bool)[:num_keypoints]
+                    annotated_mask[: annotated_tensor.shape[0]] = annotated_tensor
+                    keypoint_tensor[~annotated_mask] = unannotated
+                keypoint_tensors.append(keypoint_tensor)
 
             if len(keypoint_tensors) > 0:
                 keypoints_out = torch.stack(keypoint_tensors, dim=0)

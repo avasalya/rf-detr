@@ -491,3 +491,81 @@ class TestComputeL1KeypointLossOobClass:
             assert loss.requires_grad, f"Loss[{i}] must stay connected to the autograd graph"
             assert torch.isfinite(loss).all(), f"Loss[{i}] must be finite, got {loss}"
             torch.testing.assert_close(loss, torch.zeros_like(loss))
+
+
+class TestUnannotatedKeypoints:
+    """Keypoints with ``v < 0`` (not annotated by the source dataset) contribute to no keypoint term."""
+
+    def test_loss_ignores_unannotated_slots(self) -> None:
+        """Changing predictions on unannotated slots leaves every loss term unchanged."""
+        torch.manual_seed(0)
+        pred_keypoints = torch.randn(2, 17, 7)
+        target_keypoints = torch.rand(2, 17, 3)
+        target_keypoints[:, :, 2] = 2.0
+        target_keypoints[:, 5:, 2] = -1.0
+        kwargs = {
+            "target_keypoints": target_keypoints,
+            "target_classes": torch.tensor([0, 0]),
+            "target_areas": torch.tensor([1.0, 2.0]),
+            "num_keypoints_per_class": [17],
+        }
+        perturbed = pred_keypoints.clone()
+        perturbed[:, 5:] = torch.randn_like(perturbed[:, 5:]) * 10
+
+        base = compute_l1_keypoint_loss(all_pred_keypoints=pred_keypoints, **kwargs)
+        moved = compute_l1_keypoint_loss(all_pred_keypoints=perturbed, **kwargs)
+
+        for base_term, moved_term in zip(base, moved):
+            assert torch.allclose(base_term, moved_term)
+
+    def test_loss_matches_target_restricted_to_annotated_slots(self) -> None:
+        """Findable/visible losses equal the loss on a schema holding only the annotated slots."""
+        torch.manual_seed(0)
+        pred_keypoints = torch.randn(1, 17, 7)
+        target_keypoints = torch.rand(1, 17, 3)
+        target_keypoints[:, :, 2] = 0.0
+        target_keypoints[:, :5, 2] = 2.0
+        target_keypoints[:, 10:, 2] = -1.0
+        common = {"target_classes": torch.tensor([0]), "target_areas": torch.tensor([1.0])}
+
+        masked = compute_l1_keypoint_loss(
+            all_pred_keypoints=pred_keypoints,
+            target_keypoints=target_keypoints,
+            num_keypoints_per_class=[17],
+            **common,
+        )
+        restricted = compute_l1_keypoint_loss(
+            all_pred_keypoints=pred_keypoints[:, :10],
+            target_keypoints=target_keypoints[:, :10],
+            num_keypoints_per_class=[10],
+            **common,
+        )
+
+        assert torch.allclose(masked[1], restricted[1])
+        assert torch.allclose(masked[2], restricted[2])
+
+    def test_matching_cost_ignores_unannotated_slots(self) -> None:
+        """Findable/visible matching costs equal the costs on a schema holding only the annotated slots."""
+        torch.manual_seed(0)
+        all_pred_keypoints = torch.randn(1, 4, 17, 7)
+        target_keypoints = torch.rand(2, 17, 3)
+        target_keypoints[:, :, 2] = 0.0
+        target_keypoints[:, :6, 2] = 2.0
+        target_keypoints[:, 9:, 2] = -1.0
+        common = {"target_classes": torch.tensor([0, 0]), "target_areas": torch.tensor([1.0, 2.0])}
+
+        masked = compute_keypoint_matching_cost(
+            all_pred_keypoints=all_pred_keypoints,
+            target_keypoints=target_keypoints,
+            num_keypoints_per_class=[17],
+            **common,
+        )
+        restricted = compute_keypoint_matching_cost(
+            all_pred_keypoints=all_pred_keypoints[:, :, :9],
+            target_keypoints=target_keypoints[:, :9],
+            num_keypoints_per_class=[9],
+            **common,
+        )
+
+        assert torch.allclose(masked[1], restricted[1])
+        assert torch.allclose(masked[2], restricted[2])

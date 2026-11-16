@@ -643,6 +643,10 @@ class AlbumentationsWrapper:
             valid_idx = np.where(valid)[0]
             if len(valid_idx) > 0:
                 keypoints_out[inst[valid_idx], ptid[valid_idx]] = np.column_stack([xy[valid_idx], vis[valid_idx]])
+            # Keep the "not annotated" marker (v < 0) instead of collapsing it into a v = 0 negative.
+            unannotated_idx = np.where((inst >= 0) & (ptid >= 0) & (ptid < num_keypoints) & (vis < 0))[0]
+            if len(unannotated_idx) > 0:
+                keypoints_out[inst[unannotated_idx], ptid[unannotated_idx], 2] = -1.0
 
         result = torch.as_tensor(keypoints_out, dtype=torch.float32)
 

@@ -143,7 +143,10 @@ def _mark_invisible_keypoints(keypoints: torch.Tensor, height: int, width: int) 
     if not invalid.any():
         return keypoints
     keypoints = keypoints.clone()
+    # Keep the "not annotated" marker (v < 0) so augmentation never turns it into a v = 0 negative.
+    unannotated = keypoints[..., 2] < 0
     keypoints[invalid] = 0.0
+    keypoints[..., 2] = torch.where(unannotated, keypoints.new_tensor(-1.0), keypoints[..., 2])
     return keypoints
 
 

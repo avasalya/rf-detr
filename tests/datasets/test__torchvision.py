@@ -456,6 +456,15 @@ class TestEdgeCaseCoverage:
 
         assert result.shape == (0, 17, 3)
 
+    def test_mark_invisible_keypoints_keeps_unannotated_marker(self) -> None:
+        """Unannotated keypoints (v < 0) keep their marker; out-of-image annotated ones become v = 0."""
+        from rfdetr.datasets._torchvision import _mark_invisible_keypoints
+
+        keypoints = torch.tensor([[[10.0, 10.0, 2.0], [900.0, 10.0, 2.0], [0.0, 0.0, -1.0], [5.0, 5.0, 0.0]]])
+        result = _mark_invisible_keypoints(keypoints, height=480, width=640)
+
+        assert result[0, :, 2].tolist() == [2.0, 0.0, -1.0, 0.0]
+
 
 class TestNonUniformMaskParity:
     """Non-uniform masks are correctly resized and flipped."""
