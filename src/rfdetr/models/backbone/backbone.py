@@ -1,4 +1,9 @@
 # ------------------------------------------------------------------------
+# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources)
+# Copyright (c) 2026 Ashesh Vasalya (avasalya, asheshvasalya@gmail.com). All Rights Reserved.
+# Adapted from RF-DETR (original notice below). Licensed under the Apache License, Version 2.0
+# ------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # RF-DETR
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
@@ -57,6 +62,7 @@ class Backbone(BackboneBase):
         num_windows: int = 4,
         positional_encoding_size: int = 0,
         dual_projector: bool = False,
+        cross_attn_projector_scale: list[str] | None = None,
     ) -> None:
         super().__init__()
         # an example name here would be "dinov2_base" or "dinov2_registers_windowed_base"
@@ -113,11 +119,14 @@ class Backbone(BackboneBase):
             layer_norm=layer_norm,
             rms_norm=rms_norm,
         )
+        # The second projector may use its own levels (detrpose_v2: P3/P4/P5 for the pose stream only).
+        cross_attn_scale = cross_attn_projector_scale or self.projector_scale
+        assert sorted(cross_attn_scale) == list(cross_attn_scale), "cross_attn_projector_scale must be ascending."
         self.cross_attn_projector = (
             MultiScaleProjector(
                 in_channels=self.encoder._out_feature_channels,
                 out_channels=out_channels,
-                scale_factors=scale_factors,
+                scale_factors=[level2scalefactor[lvl] for lvl in cross_attn_scale],
                 layer_norm=layer_norm,
                 rms_norm=rms_norm,
             )

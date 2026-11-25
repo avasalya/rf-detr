@@ -1,4 +1,9 @@
 # ------------------------------------------------------------------------
+# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources)
+# Copyright (c) 2026 Ashesh Vasalya (avasalya, asheshvasalya@gmail.com). All Rights Reserved.
+# Adapted from RF-DETR (original notice below). Licensed under the Apache License, Version 2.0
+# ------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # RF-DETR
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
@@ -517,9 +522,27 @@ def _desugar_optimizer_callable(
     return f"{module}.{qualname}", extracted_kwargs, None
 
 
-_MANAGED_SCHEDULER_PRESETS = {"step", "cosine"}
-#: Default values used when managed step/cosine scheduler kwargs are omitted.
-_MANAGED_SCHEDULER_DEFAULTS: dict[str, int | float] = {"lr_drop": 100, "min_factor": 0.0}
+_MANAGED_SCHEDULER_PRESETS = {"step", "cosine", "flat_cosine", "adaptive"}
+#: Default values used when managed step/cosine/flat_cosine scheduler kwargs are omitted.
+#: ``flat_cosine`` (DEIM/RTMO style): warmup, flat LR for ``flat_ratio`` of the run, cosine to ``min_factor``; with
+#: ``plateau_patience > 0`` the whole curve is also scaled by ``plateau_factor`` each time the best-model metric has
+#: not improved by ``plateau_min_delta`` for that many validations (floor ``plateau_min_scale``).
+_MANAGED_SCHEDULER_DEFAULTS: dict[str, int | float] = {
+    "lr_drop": 100,
+    "min_factor": 0.0,
+    "flat_ratio": 0.6,
+    "plateau_patience": 0,
+    "plateau_factor": 0.3,
+    "plateau_min_scale": 0.01,
+    "plateau_min_delta": 0.001,
+    "decay_half_life_epochs": 60.0,
+    "plateau_transition_epochs": 3.0,
+}
+#: ``adaptive`` (no fixed run length): smooth half-cosine warmup, then a slow continuous exponential decay
+#: (LR halves every ``decay_half_life_epochs``), and each stall of the best-model metric (``plateau_patience``
+#: validations without ``plateau_min_delta`` improvement) starts a smooth cosine transition of the LR scale by
+#: ``plateau_factor`` over ``plateau_transition_epochs`` -- no flat phase and no step drops. ``min_factor`` is the
+#: floor; with early stopping the run ends when the metric stops improving at the floor.
 #: Keyword arguments consumed by the managed step/cosine scheduler presets.
 _MANAGED_SCHEDULER_KWARGS = frozenset(_MANAGED_SCHEDULER_DEFAULTS)
 
@@ -729,7 +752,14 @@ class ModelConfig(BaseConfig):
     use_grouppose_keypoints: bool = False
     keypoint_cross_attn: bool = True
     inter_instance_kp_attn: bool = False
-    keypoint_decoder: Literal["grouppose", "detrpose"] = "grouppose"
+    keypoint_decoder: Literal["grouppose", "detrpose", "detrpose_v2"] = "grouppose"
+    # detrpose_v2 only: options of the original-DETRPose pose stream. Keys (defaults): heads (8), points (4),
+    # dim_feedforward (1024), reg_max (32), reg_scale (4.0), dn_number (20), dn_label_noise_ratio (0.5),
+    # extra_heads (True), learnable_tgt_init (True), activation_checkpointing (False), spawn_topk (100, training),
+    # spawn_topk_eval (50), ddq (False), ddq_dense_topk (900), ddq_iou_threshold (0.8), ddq_mode ("box" | "pose").
+    detrpose_v2: dict[str, Any] = Field(default_factory=dict)
+    # Pyramid levels of the second projector (dual_projector); None = projector_scale. detrpose_v2 uses P3/P4/P5.
+    cross_attn_projector_scale: list[Literal["P3", "P4", "P5"]] | None = None
     # detrpose only: across-instance keypoint attention runs over the top-k queries of each group (two-stage
     # proposals are score-sorted); remaining queries skip it. ``0`` means all queries.
     detrpose_across_topk: int = 100
@@ -1287,6 +1317,15 @@ class TrainConfig(BaseConfig):
     keypoint_findable_loss_coef: float = 0
     keypoint_visible_loss_coef: float = 0
     keypoint_nll_loss_coef: float = 0
+    # detrpose_v2 (original DETRPose terms): OKS loss, VFL with OKS target on the pose score, OKS matching cost.
+    keypoint_oks_loss_coef: float = 4.0
+    keypoint_vfl_loss_coef: float = 2.0
+    keypoint_oks_cost_coef: float = 4.0
+    # FAMO (NeurIPS'23) balancing of the five COCO-WholeBody parts: dynamic part shares (start = the shares of
+    # keypoint_loss_weights) so a part whose loss stalls gains weight; needs 133 keypoint_loss_weights.
+    keypoint_famo: bool = False
+    keypoint_famo_lr: float = 0.025
+    keypoint_famo_gamma: float = 0.01
     keypoint_oks_sigmas: list[float] | None = None
     # Per-keypoint loss weights (length = max keypoints per class). The keypoint loss becomes a weighted mean over
     # each target's valid keypoints, so a group's share of the loss is set by its weights, not its keypoint count.
@@ -1348,16 +1387,31 @@ class TrainConfig(BaseConfig):
             "The direct CPU accelerator always uses full fp32."
         ),
     )
-    best_model_metric: Literal["map", "mar"] = Field(
+    best_model_metric: Literal["map", "mar", "map_weighted", "map_weighted_pareto"] = Field(
         default="map",
         description=(
             "Validation metric that selects the best checkpoint, and (when early_stopping=True) "
             "that early stopping monitors. 'map' (default) uses the task's mAP@50:95 (keypoint OKS "
             "AP, segmentation mask AP, or box AP). 'mar' uses box mAR at the configured eval_max_dets "
             "for detection and segmentation, and keypoint mAR (OKS-based) at fixed COCO maxDets=20. "
-            "Segmentation mAR is box-level because torchmetrics does not expose a separate mask mAR."
+            "Segmentation mAR is box-level because torchmetrics does not expose a separate mask mAR. "
+            "'map_weighted' (keypoints, needs keypoint_part_metrics=True) uses the part-weighted COCO-WholeBody AP: "
+            "per-part OKS AP (body, foot, face, left/right hand) weighted by keypoint_part_weights. "
+            "'map_weighted_pareto' only counts an epoch as better when the weighted AP rises and no part listed in "
+            "keypoint_pareto_parts (body, foot, face, lefthand, righthand, wholebody) falls below its value at the "
+            "current best epoch by more than its noise tolerance: no part may be traded for another."
         ),
     )
+    # COCO-WholeBody (133 kp) per-part keypoint AP during validation: logs keypoint_map_<part>, keypoint_map_weighted
+    # (weights below) and keypoint_map_hmean (harmonic mean of the parts).
+    keypoint_part_metrics: bool = False
+    keypoint_part_weights: dict[str, float] = Field(
+        default_factory=lambda: {"body": 0.25, "foot": 0.10, "face": 0.15, "lefthand": 0.25, "righthand": 0.25}
+    )
+    # Part -> noise tolerance in AP units (0.001 = 0.1 AP) for best_model_metric='map_weighted_pareto'.
+    keypoint_pareto_parts: dict[str, float] = Field(default_factory=dict)
+    # Epoch -> square training/validation resolution from that epoch on (e.g. {10: 672}); empty = fixed resolution.
+    resolution_schedule: dict[int, int] = Field(default_factory=dict)
     early_stopping: bool = False
     early_stopping_patience: int = 10
     early_stopping_min_delta: float = 0.001

@@ -1,4 +1,9 @@
 # ------------------------------------------------------------------------
+# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources)
+# Copyright (c) 2026 Ashesh Vasalya (avasalya, asheshvasalya@gmail.com). All Rights Reserved.
+# Adapted from RF-DETR (original notice below). Licensed under the Apache License, Version 2.0
+# ------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # RF-DETR
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
@@ -13,7 +18,65 @@ from typing import Any
 import numpy as np
 import torch
 
-from rfdetr.evaluation.coco_eval import CocoEvaluator
+import copy
+
+from faster_coco_eval import COCO
+
+from rfdetr.evaluation.coco_eval import CocoEvaluator, _merge_wholebody_keypoints
+
+#: COCO-WholeBody 133-keypoint parts (start, end) in the concatenated layout (body, foot, face, left/right hand).
+WHOLEBODY_PARTS: dict[str, tuple[int, int]] = {
+    "body": (0, 17),
+    "foot": (17, 23),
+    "face": (23, 91),
+    "lefthand": (91, 112),
+    "righthand": (112, 133),
+}
+
+
+def _part_ground_truth(coco_gt: Any, start: int, end: int) -> COCO:
+    """Ground truth restricted to keypoints ``[start, end)`` (WholeBody part fields merged first).
+
+    A person with no labelled keypoint of the part gets ``num_keypoints = 0``, which COCOeval ignores for that part
+    (no TP, no FP), as in the official per-part COCO-WholeBody evaluators.
+
+    Args:
+        coco_gt: Dataset COCO object.
+        start: First keypoint of the part.
+        end: One past the last keypoint.
+
+    Returns:
+        A new faster-coco-eval ``COCO`` with ``end - start`` keypoints per annotation and category.
+    """
+    gt = COCO()
+    gt.dataset = copy.deepcopy(coco_gt.dataset)
+    gt.createIndex()
+    _merge_wholebody_keypoints(gt)
+    for annotation in gt.dataset.get("annotations", []):
+        keypoints = list(annotation.get("keypoints") or [])
+        keypoints = keypoints[3 * start : 3 * end] + [0] * max(0, 3 * end - max(len(keypoints), 3 * start))
+        annotation["keypoints"] = keypoints[: 3 * (end - start)]
+        annotation["num_keypoints"] = sum(1 for v in annotation["keypoints"][2::3] if v > 0)
+    for category in gt.dataset.get("categories", []):
+        if category.get("keypoints"):
+            category["keypoints"] = [f"kp{i}" for i in range(end - start)]
+            category["skeleton"] = []
+    gt.createIndex()
+    label2cat = getattr(coco_gt, "label2cat", None)
+    if label2cat is not None:
+        gt.label2cat = copy.deepcopy(label2cat)
+    return gt
+
+
+def _slice_keypoints(batch: dict[int, dict[str, Any]], start: int, end: int) -> dict[int, dict[str, Any]]:
+    """Copy of a prediction batch whose ``keypoints [N, K, 3]`` keep only ``[start, end)``."""
+    sliced = {}
+    for image_id, prediction in batch.items():
+        prediction = dict(prediction)
+        if "keypoints" in prediction and isinstance(prediction["keypoints"], torch.Tensor):
+            prediction["keypoints"] = prediction["keypoints"][:, start:end]
+        sliced[image_id] = prediction
+    return sliced
 
 
 class OKSKey(str, Enum):
@@ -127,10 +190,20 @@ class MetricKeypointOKS:
         coco_gt: Any,
         keypoint_oks_sigmas: list[float] | None = None,
         max_dets: int = DEFAULT_KEYPOINT_MAX_DETS,
+        part_weights: dict[str, float] | None = None,
+        pareto_parts: dict[str, float] | None = None,
     ) -> None:
         self._coco_gt = coco_gt
         self._keypoint_oks_sigmas = keypoint_oks_sigmas
         self._max_dets = max_dets
+        # COCO-WholeBody per-part AP (only for 133-keypoint data with 133 sigmas); ground truth built lazily, once.
+        self._part_weights = part_weights
+        self._part_gts: dict[str, COCO] = {}
+        # Pareto gate (part -> noise tolerance in AP units, e.g. {"body": 0.001}; "wholebody" = 133-keypoint AP):
+        # map_weighted_pareto rises only when map_weighted rises and no listed part falls below its value at the last
+        # accepted epoch minus its tolerance; otherwise it repeats the last accepted value (= no improvement).
+        self._pareto_parts = dict(pareto_parts or {})
+        self._accepted: dict[str, float] = {}
         # List of per-batch prediction dicts — NOT merged into a single dict.
         # Using a list preserves all predictions when the same image_id appears in
         # multiple batches (e.g. DDP DistributedSampler padding), matching the
@@ -247,9 +320,62 @@ class MetricKeypointOKS:
             f"Expected coco keypoint stats shape {_KPS_STATS_SHAPE}, got {stats.shape}; "
             "pycocotools _summarizeKps() contract violated — check faster_coco_eval version"
         )
-        return {
+        result: dict[str, float] = {
             OKSKey.MAP: float(stats[0]),
             OKSKey.MAP_50: float(stats[1]),
             OKSKey.MAP_75: float(stats[2]),
             OKSKey.MAR: float(stats[5]),
         }
+        result.update(self._compute_parts(result[OKSKey.MAP]))
+        return result
+
+    def _compute_parts(self, wholebody_ap: float) -> dict[str, float]:
+        """Per-part COCO-WholeBody AP/AR plus the weighted and harmonic means (empty when not configured).
+
+        Returns:
+            ``map_<part>``, ``mar_<part>``, ``map_weighted``, ``mar_weighted``, ``map_hmean`` and, with Pareto
+            parts, ``map_weighted_pareto``. ``wholebody_ap`` (133-keypoint OKS AP) can be listed as ``wholebody``.
+        """
+        sigmas = self._keypoint_oks_sigmas
+        if not self._part_weights or sigmas is None or len(sigmas) != 133:
+            return {}
+        result: dict[str, float] = {}
+        for part, (start, end) in WHOLEBODY_PARTS.items():
+            if part not in self._part_gts:
+                self._part_gts[part] = _part_ground_truth(self._coco_gt, start, end)
+            evaluator = CocoEvaluator(
+                self._part_gts[part],
+                ["keypoints"],
+                max_dets=self._max_dets,
+                keypoint_oks_sigmas=list(sigmas[start:end]),
+                log_summary=False,
+            )
+            for batch in self._batches:
+                evaluator.update(_slice_keypoints(batch, start, end))
+            evaluator.synchronize_between_processes()
+            evaluator.accumulate()
+            part_stats = evaluator.coco_eval["keypoints"].stats
+            result[f"map_{part}"] = float(part_stats[0])
+            result[f"mar_{part}"] = float(part_stats[5])
+        total = sum(self._part_weights.get(part, 0.0) for part in WHOLEBODY_PARTS)
+        if total > 0:
+            for metric in ("map", "mar"):
+                result[f"{metric}_weighted"] = sum(
+                    self._part_weights.get(part, 0.0) * max(result[f"{metric}_{part}"], 0.0) for part in WHOLEBODY_PARTS
+                ) / total
+        aps = [max(result[f"map_{part}"], 1e-6) for part in WHOLEBODY_PARTS]
+        result["map_hmean"] = len(aps) / sum(1.0 / ap for ap in aps)
+        if self._pareto_parts and "map_weighted" in result:
+            current = {part: wholebody_ap if part == "wholebody" else result.get(f"map_{part}", -1.0)
+                       for part in self._pareto_parts}
+            current["weighted"] = result["map_weighted"]
+            accepted = self._accepted
+            no_part_fell = all(
+                current[part] >= accepted[part] - float(tolerance)
+                for part, tolerance in self._pareto_parts.items()
+                if part in accepted and current[part] >= 0
+            )
+            if not accepted or (current["weighted"] > accepted["weighted"] and no_part_fell):
+                self._accepted = current
+            result["map_weighted_pareto"] = self._accepted["weighted"]
+        return result

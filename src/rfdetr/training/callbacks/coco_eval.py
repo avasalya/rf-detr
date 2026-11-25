@@ -1,4 +1,9 @@
 # ------------------------------------------------------------------------
+# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources)
+# Copyright (c) 2026 Ashesh Vasalya (avasalya, asheshvasalya@gmail.com). All Rights Reserved.
+# Adapted from RF-DETR (original notice below). Licensed under the Apache License, Version 2.0
+# ------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # RF-DETR
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
@@ -213,6 +218,8 @@ class COCOEvalCallback(Callback):
         eval_ema_only: bool | None = None,
         eval_base_model: bool | None = None,
         eval_backend: CocoEvalBackend = "vernier",
+        keypoint_part_weights: dict[str, float] | None = None,
+        keypoint_pareto_parts: dict[str, float] | None = None,
     ) -> None:
         super().__init__()
         self._max_dets = max_dets
@@ -243,6 +250,9 @@ class COCOEvalCallback(Callback):
         self._train_segm_skip_warned: bool = False
         self._keypoint_oks_metrics: dict[str, MetricKeypointOKS] = {}
         self._keypoint_oks_sigmas = keypoint_oks_sigmas
+        # COCO-WholeBody per-part AP (keypoint_map_<part>, keypoint_map_weighted, keypoint_map_hmean); None = off.
+        self._keypoint_part_weights = keypoint_part_weights
+        self._keypoint_pareto_parts = keypoint_pareto_parts
         # Each evaluation loader may have a distinct padded DistributedSampler. Keep its rule and local position
         # separate so Lightning's interleaved multi-loader hooks never apply loader 0's state to another split.
         self._eval_padding: dict[int, tuple[int, int, int]] = {}
@@ -1218,6 +1228,8 @@ class COCOEvalCallback(Callback):
             coco_api,
             keypoint_oks_sigmas=self._keypoint_oks_sigmas,
             max_dets=self._max_dets,
+            part_weights=self._keypoint_part_weights,
+            pareto_parts=self._keypoint_pareto_parts,
         )
         self._keypoint_oks_metrics[split] = metric
         return metric
@@ -1313,6 +1325,13 @@ class COCOEvalCallback(Callback):
                 "keypoint_map_75": (OKSKey.MAP_75, False),
                 "keypoint_mAR": (OKSKey.MAR, False),
             }
+            # Per-part COCO-WholeBody metrics (present only with keypoint_part_metrics=True).
+            for stat_key in stats:
+                if str(stat_key).startswith(("map_", "mar_")) and stat_key not in ("map_50", "map_75"):
+                    keypoint_metrics[f"keypoint_{stat_key}"] = (
+                        stat_key,
+                        stat_key in ("map_weighted", "map_weighted_pareto"),
+                    )
             for metric_name, (stat_key, prog_bar) in keypoint_metrics.items():
                 value = stats.get(stat_key, -1.0)
                 if value < 0:

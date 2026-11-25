@@ -1,4 +1,9 @@
 # ------------------------------------------------------------------------
+# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources)
+# Copyright (c) 2026 Ashesh Vasalya (avasalya, asheshvasalya@gmail.com). All Rights Reserved.
+# Adapted from RF-DETR (original notice below). Licensed under the Apache License, Version 2.0
+# ------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # RF-DETR
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
@@ -31,6 +36,7 @@ from torch import Tensor, nn
 from torch.nn.utils.rnn import pad_sequence
 
 from rfdetr.models import _assignment
+from rfdetr.models.heads.detrpose_v2 import keypoint_oks
 from rfdetr.models.heads.keypoints import compute_keypoint_matching_cost
 from rfdetr.models.heads.segmentation import point_sample
 from rfdetr.utilities.box_ops import (
@@ -119,6 +125,9 @@ class _TargetSideSafety(NamedTuple):
     num_classes: int
 
 
+#: Matching-cost penalty for pairing a person with a detrpose_v2 query that spawned no pose (see ``forward``).
+_POSE_SLOT_PENALTY = 100.0
+
 class HungarianMatcher(nn.Module):
     """This class computes an assignment between the targets and the predictions of the network For efficiency reasons,
     the targets don't include the no_object.
@@ -147,6 +156,9 @@ class HungarianMatcher(nn.Module):
         keypoint_findable_loss_coef: float = 0.0,
         keypoint_visible_loss_coef: float = 0.0,
         keypoint_nll_loss_coef: float = 0.0,
+        cost_oks: float = 0.0,
+        keypoint_oks_sigmas: list[float] | None = None,
+        keypoint_oks_weights: list[float] | None = None,
     ):
         """Creates the matcher.
 
@@ -175,6 +187,12 @@ class HungarianMatcher(nn.Module):
         self.keypoint_findable_loss_coef = keypoint_findable_loss_coef
         self.keypoint_visible_loss_coef = keypoint_visible_loss_coef
         self.keypoint_nll_loss_coef = keypoint_nll_loss_coef
+        # DETRPose OKS matching cost (detrpose_v2); 0 disables it.
+        self.cost_oks = cost_oks
+        self.keypoint_oks_sigmas = keypoint_oks_sigmas
+        self.keypoint_oks_weights = keypoint_oks_weights
+        keypoint_classes = [i for i, n in enumerate(self.num_keypoints_per_class) if n > 0]
+        self.pose_class_index = keypoint_classes[0] if keypoint_classes else 0
         self._warned_non_finite_costs = False
         self._compile_l1_cost = False
         self._l1_cost_compile_options: dict[str, Any] = {}
@@ -1080,6 +1098,20 @@ class HungarianMatcher(nn.Module):
             cost_findable = cost_findable.flatten(0, 1)
             cost_visible = cost_visible.flatten(0, 1)
             cost_nll = cost_nll.flatten(0, 1)
+            cost_oks = None
+            if self.cost_oks > 0 and self.keypoint_oks_sigmas is not None:
+                pred_xy = outputs["pred_keypoints"].flatten(0, 1)[..., : tgt_keypoints.shape[1], :2].float()
+                sigmas = pred_xy.new_tensor(self.keypoint_oks_sigmas)[: tgt_keypoints.shape[1]]
+                weights = (
+                    pred_xy.new_tensor(self.keypoint_oks_weights)[: tgt_keypoints.shape[1]]
+                    if self.keypoint_oks_weights is not None
+                    else None
+                )
+                oks = keypoint_oks(
+                    pred_xy, tgt_keypoints.float(), target_areas.float() * 0.53, sigmas, weights, pairwise=True
+                )
+                has_kps = (tgt_keypoints[..., 2] > 0).any(-1)
+                cost_oks = torch.where(has_kps[None, :], 1 - oks, torch.zeros_like(oks))
 
         # Final cost matrix
         cost_matrix: Tensor = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
@@ -1092,6 +1124,16 @@ class HungarianMatcher(nn.Module):
                 + self.keypoint_findable_loss_coef * cost_findable
                 + self.keypoint_visible_loss_coef * cost_visible
                 + self.keypoint_nll_loss_coef * cost_nll
+            )
+            if cost_oks is not None:
+                cost_matrix = cost_matrix + self.cost_oks * cost_oks
+        if "pose_match_mask" in outputs and tgt_ids.numel() > 0:
+            # detrpose_v2: a person should be matched to a query that carries a pose-stream query; the others are
+            # only used once every pose-carrying query is taken (e.g. more people than spawned candidates).
+            allowed = outputs["pose_match_mask"].flatten(0, 1).to(cost_matrix.device)
+            person_targets = tgt_ids.to(cost_matrix.device) == self.pose_class_index
+            cost_matrix = cost_matrix + _POSE_SLOT_PENALTY * ((~allowed)[:, None] & person_targets[None, :]).to(
+                cost_matrix.dtype
             )
         cost_matrix = cost_matrix.view(bs, num_queries, -1).float()
         if "valid" in targets[0]:
@@ -1152,6 +1194,11 @@ def build_matcher(args: Any) -> HungarianMatcher:
         "keypoint_findable_loss_coef": getattr(args, "keypoint_findable_loss_coef", 0.0),
         "keypoint_visible_loss_coef": getattr(args, "keypoint_visible_loss_coef", 0.0),
         "keypoint_nll_loss_coef": getattr(args, "keypoint_nll_loss_coef", 0.0),
+        "cost_oks": getattr(args, "keypoint_oks_cost_coef", 0.0)
+        if getattr(args, "keypoint_decoder", "grouppose") == "detrpose_v2"
+        else 0.0,
+        "keypoint_oks_sigmas": getattr(args, "keypoint_oks_sigmas", None),
+        "keypoint_oks_weights": getattr(args, "keypoint_loss_weights", None),
     }
     if args.segmentation_head:
         return HungarianMatcher(

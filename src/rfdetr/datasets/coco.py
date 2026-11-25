@@ -1,4 +1,9 @@
 # ------------------------------------------------------------------------
+# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources)
+# Copyright (c) 2026 Ashesh Vasalya (avasalya, asheshvasalya@gmail.com). All Rights Reserved.
+# Adapted from RF-DETR (original notice below). Licensed under the Apache License, Version 2.0
+# ------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # RF-DETR
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
@@ -597,6 +602,36 @@ def crowd_regions_from_coco(coco_api: Any) -> dict[int, list[CrowdRegion]]:
     return regions
 
 
+#: Per-annotation fields of merged multi-dataset files (``scripts/build_wholebody_ext_dataset.py``) that no RF-DETR
+#: loss or metric reads; dropped at load time to cut the resident annotation memory of every dataloader worker.
+_UNUSED_ANNOTATION_FIELDS = ("extra_kpts", "extra_annotated", "mask_valid", "mask_source", "lvis_segmentation")
+
+
+def _drop_unused_annotation_fields(coco_api: Any, include_masks: bool) -> None:
+    """Remove annotation fields this model never reads (in place, shared by ``dataset`` and ``anns``).
+
+    Without a mask head, ``segmentation`` is dropped too, except on ``iscrowd=1`` annotations: those regions are
+    still scored as crowd by the box/keypoint evaluators.
+
+    Args:
+        coco_api: The dataset's COCO object.
+        include_masks: The model decodes masks (keep ``segmentation``).
+
+    Examples:
+        >>> from types import SimpleNamespace
+        >>> anns = [{"segmentation": [[0, 0]], "extra_kpts": [], "iscrowd": 0}, {"segmentation": [], "iscrowd": 1}]
+        >>> coco = SimpleNamespace(dataset={"annotations": anns}, anns={})
+        >>> _drop_unused_annotation_fields(coco, include_masks=False)
+        >>> anns
+        [{'iscrowd': 0}, {'segmentation': [], 'iscrowd': 1}]
+    """
+    for annotation in getattr(coco_api, "dataset", {}).get("annotations", []):
+        for field in _UNUSED_ANNOTATION_FIELDS:
+            annotation.pop(field, None)
+        if not include_masks and not annotation.get("iscrowd"):
+            annotation.pop("segmentation", None)
+
+
 class CocoDetection(torchvision.datasets.CocoDetection):  # type: ignore[misc]
     """COCO detection dataset with optional sparse-to-contiguous category ID remapping.
 
@@ -661,6 +696,7 @@ class CocoDetection(torchvision.datasets.CocoDetection):  # type: ignore[misc]
         self._draft_size = draft_size
         self.include_masks = include_masks
         self.include_keypoints = include_keypoints
+        _drop_unused_annotation_fields(self.coco, include_masks)
         if cat2label is not None and not remap_category_ids:
             raise ValueError(
                 "cat2label was supplied but remap_category_ids is False, so the mapping would be ignored. "

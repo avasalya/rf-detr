@@ -1,4 +1,9 @@
 # ------------------------------------------------------------------------
+# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources)
+# Copyright (c) 2026 Ashesh Vasalya (avasalya, asheshvasalya@gmail.com). All Rights Reserved.
+# Adapted from RF-DETR (original notice below). Licensed under the Apache License, Version 2.0
+# ------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # RF-DETR
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
@@ -51,6 +56,8 @@ _MC_NAMESPACE_FIELDS = {
     "inter_instance_kp_attn",
     "keypoint_decoder",
     "detrpose_across_topk",
+    "detrpose_v2",
+    "cross_attn_projector_scale",
     "grouppose_keypoint_dim_downscale",
     "dual_projector",
     "dual_projector_kp_only",

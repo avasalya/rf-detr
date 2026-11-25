@@ -1,4 +1,9 @@
 # ------------------------------------------------------------------------
+# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources)
+# Copyright (c) 2026 Ashesh Vasalya (avasalya, asheshvasalya@gmail.com). All Rights Reserved.
+# Adapted from RF-DETR (original notice below). Licensed under the Apache License, Version 2.0
+# ------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # RF-DETR
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
@@ -19,6 +24,7 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
+from rfdetr.models.heads.detrpose_v2 import keypoint_oks, varifocal_pose_loss
 from rfdetr.models.heads.keypoints import compute_l1_keypoint_loss
 from rfdetr.models.heads.segmentation import (
     calculate_uncertainty,
@@ -475,6 +481,81 @@ def sigmoid_ce_loss(
 sigmoid_ce_loss_jit = sigmoid_ce_loss if sys.version_info >= (3, 14) else torch.jit.script(sigmoid_ce_loss)
 
 
+_WHOLEBODY_PART_NAMES = (("body", 0, 17), ("foot", 17, 23), ("face", 23, 91), ("lefthand", 91, 112),
+                         ("righthand", 112, 133))
+_WHOLEBODY_PARTS = tuple((start, end) for _, start, end in _WHOLEBODY_PART_NAMES)
+
+
+class _PartFAMO(nn.Module):
+    """FAMO (Liu et al., NeurIPS 2023) over the five COCO-WholeBody parts.
+
+    FAMO minimises ``sum_p z_p log l_p`` with ``z = softmax(xi)``; its gradient is the linear combination of the part
+    losses with shares ``w_p = (z_p / l_p) / sum_q (z_q / l_q)``, so the keypoint losses keep their usual form and only
+    the part shares change. After each step ``xi`` moves along ``-J^T delta`` (Adam, weight decay ``gamma``), where
+    ``delta_p = log l_p(prev) - log l_p(now)`` and ``J`` is the softmax Jacobian: a part whose loss falls slowly gains
+    weight, so no part stalls while the others improve. The weight decay pulls ``xi`` back to the configured shares
+    (FAMO's original decays toward uniform), so the configured priorities stay the resting point. ``xi`` starts at ``log`` of the configured part shares, and the
+    shares are spread over each part's keypoints in proportion to the configured per-keypoint weights. All state is in
+    persistent buffers (saved in checkpoints, identical on every DDP rank because the update uses all-reduced losses).
+
+    Examples:
+        >>> famo = _PartFAMO(torch.full((133,), 1.0 / 133), lr=0.1, gamma=0.0)
+        >>> famo.update(torch.ones(5), torch.ones(5, dtype=torch.bool))
+        >>> famo.update(torch.tensor([0.5, 1.0, 1.0, 1.0, 1.0]), torch.ones(5, dtype=torch.bool))  # body improved
+        >>> bool(famo.part_shares()[0] < famo.part_shares()[1:].mean())
+        True
+    """
+
+    def __init__(self, keypoint_weights: Tensor, lr: float, gamma: float) -> None:
+        super().__init__()
+        shares = torch.stack([keypoint_weights[s:e].sum() for s, e in _WHOLEBODY_PARTS]).clamp(min=1e-6)
+        within = torch.cat([keypoint_weights[s:e] / keypoint_weights[s:e].sum().clamp(min=1e-12)
+                            for s, e in _WHOLEBODY_PARTS])
+        self.lr, self.gamma = float(lr), float(gamma)
+        self.register_buffer("within_part", within)  # per-keypoint split inside its part (sums to 1 per part)
+        self.register_buffer("total_weight", keypoint_weights.sum().clone())
+        self.register_buffer("logits", torch.log(shares / shares.sum()))
+        self.register_buffer("prior_logits", self.logits.clone())
+        self.register_buffer("adam_m", torch.zeros(5))
+        self.register_buffer("adam_v", torch.zeros(5))
+        self.register_buffer("adam_t", torch.zeros(()))
+        self.register_buffer("prev_loss", torch.full((5,), float("nan")))
+
+    def part_shares(self) -> Tensor:
+        """Current shares ``w_p`` (sum to 1)."""
+        z = torch.softmax(self.logits, dim=0)
+        prev = self.prev_loss
+        if torch.isfinite(prev).all() and (prev > 0).all():
+            z = z / prev
+        return z / z.sum()
+
+    def keypoint_weights(self) -> Tensor:
+        """``[133]`` per-keypoint weights with the configured total, distributed by the current part shares."""
+        shares = self.part_shares()
+        per_part = torch.cat([shares[p].expand(e - s) for p, (s, e) in enumerate(_WHOLEBODY_PARTS)])
+        return per_part * self.within_part * self.total_weight
+
+    @torch.no_grad()
+    def update(self, part_loss: Tensor, present: Tensor) -> None:
+        """One FAMO step from this step's per-part losses (parts absent from the batch keep their state)."""
+        part_loss = part_loss.to(self.logits.device).float().clamp(min=1e-8)
+        present = present.to(self.logits.device)
+        prev = self.prev_loss
+        valid = present & torch.isfinite(prev)
+        if valid.any():
+            delta = torch.where(valid, prev.log() - part_loss.log(), torch.zeros_like(part_loss))
+            z = torch.softmax(self.logits, dim=0)
+            # Decay toward the configured shares (not toward uniform) so the prior part balance is the resting point.
+            grad = z * (delta - (z * delta).sum()) + self.gamma * (self.logits - self.prior_logits)
+            self.adam_t += 1
+            self.adam_m.mul_(0.9).add_(0.1 * grad)
+            self.adam_v.mul_(0.999).add_(0.001 * grad * grad)
+            m_hat = self.adam_m / (1 - 0.9 ** self.adam_t)
+            v_hat = self.adam_v / (1 - 0.999 ** self.adam_t)
+            self.logits -= self.lr * m_hat / (v_hat.sqrt() + 1e-8)
+        self.prev_loss = torch.where(present, part_loss, prev)
+
+
 class SetCriterion(nn.Module):
     """This class computes the loss for Conditional DETR.
 
@@ -504,6 +585,10 @@ class SetCriterion(nn.Module):
         mask_point_sample_ratio: int = 16,
         num_keypoints_per_class: list[int] | None = None,
         keypoint_loss_weights: list[float] | None = None,
+        keypoint_oks_sigmas: list[float] | None = None,
+        keypoint_famo: bool = False,
+        keypoint_famo_lr: float = 0.025,
+        keypoint_famo_gamma: float = 0.01,
     ) -> None:
         """Create the criterion.
 
@@ -515,6 +600,11 @@ class SetCriterion(nn.Module):
             focal_alpha: alpha in Focal Loss
             group_detr: Number of groups to speed detr training. Default is 1.
             keypoint_loss_weights: optional per-keypoint weights; turns the keypoint loss into a weighted mean
+                (also the per-keypoint weights of the detrpose_v2 OKS loss / VFL target)
+            keypoint_oks_sigmas: per-keypoint OKS sigmas for the detrpose_v2 ``"pose"`` loss
+            keypoint_famo: balance the COCO-WholeBody parts with FAMO (needs 133 ``keypoint_loss_weights``)
+            keypoint_famo_lr: FAMO logit learning rate (Adam)
+            keypoint_famo_gamma: FAMO logit weight decay
         """
         super().__init__()
         self.num_classes = num_classes
@@ -535,6 +625,20 @@ class SetCriterion(nn.Module):
             torch.tensor(keypoint_loss_weights, dtype=torch.float32) if keypoint_loss_weights else None,
             persistent=False,
         )
+        self.keypoint_oks_sigmas: Tensor | None
+        self.register_buffer(
+            "keypoint_oks_sigmas",
+            torch.tensor(keypoint_oks_sigmas, dtype=torch.float32) if keypoint_oks_sigmas else None,
+            persistent=False,
+        )
+        keypoint_classes = [i for i, n in enumerate(self.num_keypoints_per_class) if n > 0]
+        self.pose_class_index = keypoint_classes[0] if keypoint_classes else 0
+        self.famo: _PartFAMO | None = None
+        if keypoint_famo:
+            if not keypoint_loss_weights or len(keypoint_loss_weights) != 133:
+                raise ValueError("keypoint_famo needs the 133 COCO-WholeBody keypoint_loss_weights")
+            self.famo = _PartFAMO(torch.tensor(keypoint_loss_weights, dtype=torch.float32), keypoint_famo_lr,
+                                  keypoint_famo_gamma)
         self._compile_batched_detection_losses = False
         self._compiled_batched_detection_losses: Callable[..., tuple[Tensor, Tensor, Tensor, Tensor]] | None = None
 
@@ -1004,7 +1108,7 @@ class SetCriterion(nn.Module):
             target_classes=target_classes.to(src_keypoints.device),
             target_areas=target_areas.to(src_keypoints.device),
             num_keypoints_per_class=self.num_keypoints_per_class,
-            keypoint_weights=self.keypoint_loss_weights,
+            keypoint_weights=self._keypoint_weights(),
         )
 
         return {
@@ -1013,6 +1117,236 @@ class SetCriterion(nn.Module):
             "loss_keypoints_visible": loss_visible.sum() / num_boxes,
             "loss_keypoints_nll": loss_nll.sum() / num_boxes,
         }
+
+    def _keypoint_weights(self) -> Tensor | None:
+        """Per-keypoint loss weights of this step: FAMO's dynamic part shares, else ``keypoint_loss_weights``."""
+        famo = getattr(self, "famo", None)
+        if famo is not None:
+            return famo.keypoint_weights()
+        return getattr(self, "keypoint_loss_weights", None)
+
+    @torch.no_grad()
+    def _famo_part_losses(
+        self, outputs: dict[str, Any], targets: list[dict[str, Tensor]], indices: list[tuple[Tensor, Tensor]]
+    ) -> tuple[Tensor, Tensor]:
+        """Per-part keypoint loss of the final layer (mean L1 / sqrt(area) + mean (1 - OKS)) for the FAMO update.
+
+        Returns:
+            ``(loss_sum [5], count [5])`` over matched persons with at least one labelled keypoint of the part.
+        """
+        assert self.famo is not None
+        device = outputs["pred_keypoints"].device
+        loss_sum = torch.zeros(len(_WHOLEBODY_PARTS), device=device)
+        count = torch.zeros(len(_WHOLEBODY_PARTS), device=device)
+        idx = self._get_src_permutation_idx(indices)
+        if idx[0].numel() == 0:
+            return loss_sum, count
+        pred = outputs["pred_keypoints"][idx][..., :2].float()
+        tk = torch.cat([t["keypoints"][j] for t, (_, j) in zip(targets, indices)], dim=0).to(device).float()
+        tb = torch.cat([t["boxes"][j] for t, (_, j) in zip(targets, indices)], dim=0).to(device).float()
+        tl = torch.cat([t["labels"][j] for t, (_, j) in zip(targets, indices)], dim=0).to(device)
+        keep = tl == self.pose_class_index
+        pred, tk, tb = pred[keep], tk[keep], tb[keep]
+        if pred.shape[0] == 0:
+            return loss_sum, count
+        area = (tb[:, 2] * tb[:, 3]).clamp(min=1e-6)
+        sigmas = self.keypoint_oks_sigmas.to(device) if self.keypoint_oks_sigmas is not None else None
+        for p, (start, end) in enumerate(_WHOLEBODY_PARTS):
+            vis = tk[:, start:end, 2] > 0
+            has = vis.any(-1)
+            if not has.any():
+                continue
+            l1 = ((pred[:, start:end] - tk[:, start:end, :2]).abs().sum(-1) * vis).sum(-1) / vis.sum(-1).clamp(min=1)
+            part_loss = l1 / area.sqrt()
+            if sigmas is not None:
+                oks = keypoint_oks(pred[:, start:end], tk[:, start:end], area * 0.53, sigmas[start:end])
+                part_loss = part_loss + (1 - oks)
+            loss_sum[p] = part_loss[has].sum()
+            count[p] = has.sum()
+        return loss_sum, count
+
+    def _pose_oks_terms(self, pred_xy: Tensor, target_keypoints: Tensor, target_boxes: Tensor) -> tuple[Tensor, Tensor]:
+        """OKS of matched pose predictions and whether each target has a labelled keypoint.
+
+        Args:
+            pred_xy: ``[N, K, 2]`` predicted keypoints.
+            target_keypoints: ``[N, K, 3]`` targets.
+            target_boxes: ``[N, 4]`` cxcywh boxes (area = ``0.53 * w * h``, the DETRPose fallback).
+
+        Returns:
+            ``(oks [N], has_keypoints [N])``.
+        """
+        num_kp = target_keypoints.shape[1]
+        if self.keypoint_oks_sigmas is None:
+            raise ValueError("the 'pose' loss needs keypoint_oks_sigmas (TrainConfig.keypoint_oks_sigmas)")
+        sigmas = self.keypoint_oks_sigmas[:num_kp].to(pred_xy.device)
+        effective = self._keypoint_weights()
+        weights = effective[:num_kp] if effective is not None else None
+        areas = (target_boxes[:, 2] * target_boxes[:, 3] * 0.53).clamp(min=1e-6)
+        oks = keypoint_oks(pred_xy.float()[:, :num_kp], target_keypoints.float(), areas.float(), sigmas, weights)
+        return oks, (target_keypoints[..., 2] > 0).any(-1)
+
+    def _pose_losses(
+        self,
+        pred_keypoints: Tensor,
+        pose_logits: Tensor | None,
+        pose_valid: Tensor,
+        src_idx: tuple[Tensor, Tensor],
+        target_keypoints: Tensor,
+        target_boxes: Tensor,
+        target_is_person: Tensor,
+        num_boxes: Tensor,
+    ) -> dict[str, Tensor]:
+        """DETRPose OKS loss and VFL (OKS target) on one set of pose predictions.
+
+        Args:
+            pred_keypoints: ``[B, Q, K, >=2]`` predictions.
+            pose_logits: ``[B, Q]`` pose-score logits, or ``None`` (no VFL, e.g. encoder layer).
+            pose_valid: ``[B, Q]`` queries that carry a pose.
+            src_idx: Matched ``(batch, query)`` indices.
+            target_keypoints: ``[N, K, 3]`` matched targets.
+            target_boxes: ``[N, 4]`` matched boxes.
+            target_is_person: ``[N]`` matched targets of the keypoint class.
+            num_boxes: Normaliser.
+
+        Returns:
+            ``loss_pose_oks`` and (with logits) ``loss_pose_vfl``.
+        """
+        graph_zero = pred_keypoints.reshape(-1)[:0].sum()
+        matched_valid = pose_valid[src_idx] & target_is_person
+        oks, has_kps = self._pose_oks_terms(pred_keypoints[src_idx][..., :2], target_keypoints, target_boxes)
+        use = matched_valid & has_kps
+        losses = {"loss_pose_oks": ((1 - oks) * use.to(oks.dtype)).sum() / num_boxes + graph_zero}
+        if pose_logits is not None:
+            positive = torch.zeros_like(pose_valid)
+            target_score = torch.zeros_like(pose_logits, dtype=torch.float32)
+            participating = pose_valid.clone()
+            batch_idx, query_idx = src_idx
+            positive[batch_idx[use], query_idx[use]] = True
+            target_score[batch_idx[use], query_idx[use]] = oks.detach()[use]
+            # A matched person without labelled keypoints (box-only source) has no OKS target: ignore its query.
+            unlabeled = matched_valid & ~has_kps
+            participating[batch_idx[unlabeled], query_idx[unlabeled]] = False
+            losses["loss_pose_vfl"] = (
+                varifocal_pose_loss(pose_logits.float(), target_score, positive, participating, self.focal_alpha)
+                / num_boxes
+            )
+        return losses
+
+    def loss_pose(
+        self,
+        outputs: dict[str, Any],
+        targets: list[dict[str, Tensor]],
+        indices: list[tuple[Tensor, Tensor]],
+        num_boxes: Tensor,
+    ) -> dict[str, Tensor]:
+        """detrpose_v2 losses of one layer: DETRPose OKS loss + VFL with OKS target on the pose-stream score.
+
+        Uses the layer's matching; only matched queries that spawned a pose and whose target is a person with labelled
+        keypoints count as positives. L1 / findable / visible / NLL come from the ``keypoints`` loss on the same layer.
+        """
+        if "pose_valid" not in outputs:
+            return {}
+        idx = self._get_src_permutation_idx(indices)
+        target_keypoints = torch.cat([t["keypoints"][j] for t, (_, j) in zip(targets, indices)], dim=0)
+        target_boxes = torch.cat([t["boxes"][j] for t, (_, j) in zip(targets, indices)], dim=0)
+        target_labels = torch.cat([t["labels"][j] for t, (_, j) in zip(targets, indices)], dim=0)
+        return self._pose_losses(
+            outputs["pred_keypoints"],
+            outputs.get("pose_logits"),
+            outputs["pose_valid"],
+            idx,
+            target_keypoints.to(outputs["pred_keypoints"].device),
+            target_boxes.to(outputs["pred_keypoints"].device),
+            target_labels.to(outputs["pred_keypoints"].device) == self.pose_class_index,
+            num_boxes,
+        )
+
+    def _pose_location_loss(
+        self, pred_keypoints: Tensor, target_keypoints: Tensor, target_boxes: Tensor, num_boxes: Tensor
+    ) -> Tensor:
+        """RF-DETR's area-normalised, part-weighted L1 keypoint location loss on matched pairs."""
+        if pred_keypoints.shape[0] == 0:
+            return pred_keypoints.reshape(-1)[:0].sum()
+        loss_l1, _, _, _ = compute_l1_keypoint_loss(
+            all_pred_keypoints=pred_keypoints,
+            target_keypoints=target_keypoints,
+            target_classes=torch.full(
+                (pred_keypoints.shape[0],), self.pose_class_index, dtype=torch.long, device=pred_keypoints.device
+            ),
+            target_areas=target_boxes[:, 2] * target_boxes[:, 3],
+            num_keypoints_per_class=self.num_keypoints_per_class,
+            keypoint_weights=self._keypoint_weights(),
+        )
+        return loss_l1.sum() / num_boxes
+
+    def _pose_auxiliary_losses(
+        self,
+        outputs: dict[str, Any],
+        targets: list[dict[str, Tensor]],
+        layer0_indices: list[tuple[Tensor, Tensor]] | None,
+        num_boxes: Tensor,
+    ) -> dict[str, Tensor]:
+        """detrpose_v2 training-only terms: the layer-0 ``pre_pose_embed`` head and the CDN reconstruction.
+
+        The pre head reuses the matching of decoder layer 0. CDN follows the original: the positive slot of DN group
+        ``g`` for known target ``t`` is ``g * 2 * single_pad + t``; OKS and L1 on positives, VFL over all DN slots
+        (OKS target at positives), summed over the decoder layers and the pre head, normalised by
+        ``num_boxes * num_dn_group``.
+        """
+        losses: dict[str, Tensor] = {}
+        pre = outputs.get("pose_pre_outputs")
+        if pre is not None and layer0_indices is not None:
+            pre_losses = self.loss_pose(pre, targets, layer0_indices, num_boxes)
+            idx = self._get_src_permutation_idx(layer0_indices)
+            device = pre["pred_keypoints"].device
+            tk = torch.cat([t["keypoints"][j] for t, (_, j) in zip(targets, layer0_indices)], dim=0).to(device)
+            tb = torch.cat([t["boxes"][j] for t, (_, j) in zip(targets, layer0_indices)], dim=0).to(device)
+            tl = torch.cat([t["labels"][j] for t, (_, j) in zip(targets, layer0_indices)], dim=0).to(device)
+            keep = pre["pose_valid"][idx] & (tl == self.pose_class_index)
+            pre_losses["loss_keypoints_l1"] = self._pose_location_loss(
+                pre["pred_keypoints"][idx][keep], tk[keep], tb[keep], num_boxes
+            )
+            losses.update({f"{key}_pre": value for key, value in pre_losses.items()})
+
+        dn = outputs.get("pose_dn")
+        if dn is not None:
+            meta = dn["dn_meta"]
+            single_pad, groups = int(meta["single_pad"]), int(meta["num_dn_group"])
+            device = dn["pred_keypoints"].device
+            batch_list, slot_list, keypoint_list, box_list = [], [], [], []
+            for image_idx, known in enumerate(meta["known_targets"]):
+                if known.numel() == 0:
+                    continue
+                known = known.to(targets[image_idx]["keypoints"].device)
+                rank = torch.arange(known.numel(), device=device)
+                slots = (torch.arange(groups, device=device)[:, None] * 2 * single_pad + rank[None]).flatten()
+                batch_list.append(torch.full_like(slots, image_idx))
+                slot_list.append(slots)
+                keypoint_list.append(targets[image_idx]["keypoints"][known].repeat(groups, 1, 1))
+                box_list.append(targets[image_idx]["boxes"][known].repeat(groups, 1))
+            batch_idx, slot_idx = torch.cat(batch_list), torch.cat(slot_list)
+            tk = torch.cat(keypoint_list).to(device)
+            tb = torch.cat(box_list).to(device)
+            dn_norm = num_boxes * groups
+            pose_valid = torch.ones(dn["pose_logits"].shape[1:], dtype=torch.bool, device=device)
+            is_person = torch.ones_like(batch_idx, dtype=torch.bool)
+            layers = [(dn["pred_keypoints"][i], dn["pose_logits"][i]) for i in range(dn["pred_keypoints"].shape[0])]
+            layers.append((dn["pre_keypoints"], dn["pre_logits"]))
+            total: dict[str, Tensor] = {}
+            for keypoints, logits in layers:
+                layer = self._pose_losses(
+                    keypoints, logits, pose_valid, (batch_idx, slot_idx), tk, tb, is_person, dn_norm
+                )
+                terms = {
+                    "loss_pose_dn_oks": layer["loss_pose_oks"],
+                    "loss_pose_dn_vfl": layer["loss_pose_vfl"],
+                    "loss_pose_dn_l1": self._pose_location_loss(keypoints[batch_idx, slot_idx], tk, tb, dn_norm),
+                }
+                for key, value in terms.items():
+                    total[key] = total[key] + value if key in total else value
+            losses.update(total)
+        return losses
 
     def _get_src_permutation_idx(self, indices: list[tuple[Tensor, Tensor]]) -> tuple[Tensor, Tensor]:
         # permute predictions following indices
@@ -1231,6 +1565,7 @@ class SetCriterion(nn.Module):
             "boxes": self.loss_boxes,
             "masks": self.loss_masks,
             "keypoints": self.loss_keypoints,
+            "pose": self.loss_pose,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         if matched_targets is not None and loss in {"labels", "boxes"}:
@@ -1382,5 +1717,22 @@ class SetCriterion(nn.Module):
                     kwargs["matched_targets"] = matched_targets
                 layer_losses = self.get_loss(loss, layer_outputs, targets, indices, num_boxes, **kwargs)
                 losses.update({key + suffix: value for key, value in layer_losses.items()})
+
+        if getattr(self, "famo", None) is not None:
+            assert self.famo is not None
+            if self.training and "pred_keypoints" in outputs and "keypoints" in targets[0]:
+                loss_sum, count = self._famo_part_losses(outputs, targets, all_indices[0])
+                if is_dist_avail_and_initialized():
+                    stats = torch.cat([loss_sum, count])
+                    torch.distributed.all_reduce(stats)
+                    loss_sum, count = stats.chunk(2)
+                self.famo.update(loss_sum / count.clamp(min=1), count > 0)
+            for name, share in zip((n for n, _, _ in _WHOLEBODY_PART_NAMES), self.famo.part_shares()):
+                losses[f"famo_share_{name}"] = share.detach()
+
+        if "pose" in getattr(self, "losses", []) and ("pose_pre_outputs" in outputs or "pose_dn" in outputs):
+            # aux_outputs[0] is decoder layer 0, matched_outputs index 1 (index 0 is the final layer).
+            layer0_indices = all_indices[1] if "aux_outputs" in outputs and outputs["aux_outputs"] else all_indices[0]
+            losses.update(self._pose_auxiliary_losses(outputs, targets, layer0_indices, num_boxes))
 
         return losses

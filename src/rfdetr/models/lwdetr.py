@@ -1,4 +1,9 @@
 # ------------------------------------------------------------------------
+# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources)
+# Copyright (c) 2026 Ashesh Vasalya (avasalya, asheshvasalya@gmail.com). All Rights Reserved.
+# Adapted from RF-DETR (original notice below). Licensed under the Apache License, Version 2.0
+# ------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # RF-DETR
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
@@ -183,8 +188,16 @@ class LWDETR(nn.Module):
             )
         # Flag to ensure the zero-pad warning in ``_aggregate_keypoint_class_logits`` is emitted at most once.
         self._kp_zero_pad_warned = False
+        self.keypoint_decoder = getattr(self.transformer, "keypoint_decoder", "grouppose")
+        # detrpose_v2: keypoints come from the transformer's DETRPose pose stream, not from a head on the box stream.
+        self.pose_stream_enabled = getattr(self.transformer, "pose_stream_enabled", False) is True
+        self.pose_score_weight: nn.Parameter | None = None
+        if self.pose_stream_enabled:
+            # Person logit = box-stream logit + w * (pose-stream logit + LQE). w starts at 0, so the score starts as
+            # the box stream's and the pose score is blended in as it learns.
+            self.pose_score_weight = nn.Parameter(torch.zeros(1))
         self.keypoint_embed: MLP | None
-        if self.use_grouppose_keypoints:
+        if self.use_grouppose_keypoints and not self.pose_stream_enabled:
             self.keypoint_embed = MLP(
                 hidden_dim // self.grouppose_keypoint_dim_downscale,
                 hidden_dim // self.grouppose_keypoint_dim_downscale,
@@ -197,7 +210,6 @@ class LWDETR(nn.Module):
             nn.init.constant_(keypoint_out_layer.bias.data, 0)
         else:
             self.keypoint_embed = None
-        self.keypoint_decoder = getattr(self.transformer, "keypoint_decoder", "grouppose")
         if self.keypoint_decoder == "detrpose" and self.keypoint_embed is not None:
             # Share the keypoint head with the decoder for per-layer reference refinement. ``object.__setattr__``
             # keeps it out of the decoder's ``_modules`` so no duplicate state-dict keys are created.
@@ -514,8 +526,16 @@ class LWDETR(nn.Module):
             refpoint_embed_weight,
             query_feat_weight,
             cross_attn_srcs=cross_attn_srcs,
+            targets=targets if self.pose_stream_enabled else None,
+            image_size=cast(tuple[int, int], tuple(samples.tensors.shape[-2:])),
         )
-        if self.use_grouppose_keypoints:
+        pose_out: dict[str, Any] | None = None
+        if self.pose_stream_enabled:
+            hs, ref_unsigmoid, hs_enc, ref_enc, pose_out = transformer_outputs[:5]
+            keypoint_hs = None
+            enc_kp_predictions = None
+            kp_ref_offsets = None
+        elif self.use_grouppose_keypoints:
             hs, ref_unsigmoid, hs_enc, ref_enc, keypoint_hs, enc_kp_predictions = transformer_outputs[:6]
             # detrpose: per-layer box-relative keypoint reference offsets, appended just before ``cls_ts``.
             kp_ref_offsets = transformer_outputs[-2] if self.keypoint_decoder == "detrpose" else None
@@ -541,6 +561,11 @@ class LWDETR(nn.Module):
 
             outputs_class = self.class_embed(hs)
             outputs_keypoints = None
+            pose_logits = pose_valid = None
+            if pose_out is not None:
+                outputs_class, outputs_keypoints, pose_logits, pose_valid = self._detrpose_v2_layer_outputs(
+                    outputs_class, pose_out
+                )
 
             if self.use_grouppose_keypoints and self.keypoint_embed is not None:
                 if keypoint_hs is None:
@@ -590,6 +615,16 @@ class LWDETR(nn.Module):
                     outputs_masks if self.segmentation_head is not None else None,
                     outputs_keypoints,
                 )
+            if pose_out is not None and pose_logits is not None and pose_valid is not None:
+                out["pose_logits"] = pose_logits[-1]
+                out["pose_valid"] = pose_valid
+                out["pose_match_mask"] = pose_valid
+                for layer_idx, aux in enumerate(out.get("aux_outputs", [])):
+                    aux["pose_logits"] = pose_logits[layer_idx]
+                    aux["pose_valid"] = pose_valid
+                    aux["pose_match_mask"] = pose_valid
+                if self.training:
+                    out.update(self._detrpose_v2_training_outputs(pose_out, pose_valid))
 
         if self.two_stage:
             assert self.transformer.enc_out_class_embed is not None
@@ -608,6 +643,12 @@ class LWDETR(nn.Module):
 
                 cls_enc = torch.cat(cls_enc_list, dim=1)
             keypoints_enc = None
+            enc_pose_valid = None
+            if pose_out is not None:
+                keypoints_enc = self._scatter_pose_queries(
+                    self._with_extra_channels(pose_out["enc_poses"], None), pose_out, cls_enc.shape[1]
+                )
+                enc_pose_valid = self._pose_valid_mask(pose_out, cls_enc.shape[1])
             if self.use_grouppose_keypoints and enc_kp_predictions is not None:
                 keypoints_enc = self._format_keypoint_output(
                     enc_kp_predictions,
@@ -632,6 +673,8 @@ class LWDETR(nn.Module):
                     out["enc_outputs"]["pred_masks"] = masks_enc
                 if keypoints_enc is not None:
                     out["enc_outputs"]["pred_keypoints"] = keypoints_enc
+                if enc_pose_valid is not None:
+                    out["enc_outputs"]["pose_valid"] = enc_pose_valid
             else:
                 out = {"pred_logits": cls_enc, "pred_boxes": ref_enc}
                 if self.segmentation_head is not None:
@@ -640,6 +683,135 @@ class LWDETR(nn.Module):
                     out["pred_keypoints"] = keypoints_enc
 
         return out
+
+    @staticmethod
+    def _with_extra_channels(poses: Tensor, extra: Tensor | None) -> Tensor:
+        """Append RF-DETR's 6 non-xy keypoint channels (zeros when the extra heads are off) to ``poses [..., 2]``.
+
+        Args:
+            poses: Keypoint xy in normalised image coordinates.
+            extra: ``[..., 6]`` findable, visible, Cholesky ×3 and class-contribution channels, or ``None``.
+
+        Returns:
+            ``[..., 8]`` keypoints in the layout ``compute_l1_keypoint_loss`` and ``PostProcess`` expect.
+        """
+        if extra is None:
+            extra = poses.new_zeros(*poses.shape[:-1], 6)
+        return torch.cat([poses, extra.to(poses.dtype)], dim=-1)
+
+    @staticmethod
+    def _scatter_pose_queries(
+        values: Tensor, pose_out: dict[str, Any], num_queries_total: int, layered: bool = False
+    ) -> Tensor:
+        """Scatter per-candidate pose-stream values back into the box stream's query layout.
+
+        Args:
+            values: ``[(L,) B * G, M, ...]`` values for the spawned candidates (batch-major groups).
+            pose_out: Pose-stream outputs (``candidates [B, G, M]``, ``groups``).
+            num_queries_total: Box-stream queries per image (``G * nq``).
+            layered: ``values`` has a leading decoder-layer dimension.
+
+        Returns:
+            ``[(L,) B, G * nq, ...]`` with zeros at queries that spawned no pose.
+        """
+        candidates: Tensor = pose_out["candidates"]
+        bs, groups, m = candidates.shape
+        nq = num_queries_total // groups
+        offsets = torch.arange(groups, device=candidates.device)[None, :, None] * nq
+        index = (candidates + offsets).reshape(bs, groups * m)
+        if not layered:
+            values = values.unsqueeze(0)
+        num_layers = values.shape[0]
+        trailing = values.shape[3:]
+        values = values.reshape(num_layers, bs, groups * m, *trailing)
+        full = values.new_zeros(num_layers, bs, num_queries_total, *trailing)
+        expanded = index.view(1, bs, groups * m, *([1] * len(trailing))).expand(num_layers, -1, -1, *trailing)
+        full = full.scatter(2, expanded, values)
+        return full if layered else full[0]
+
+    def _pose_valid_mask(self, pose_out: dict[str, Any], num_queries_total: int) -> Tensor:
+        """Return ``[B, G * nq]``: True at queries that spawned a pose-stream query."""
+        candidates: Tensor = pose_out["candidates"]
+        ones = torch.ones(
+            candidates.shape[0] * candidates.shape[1], candidates.shape[2], dtype=torch.bool, device=candidates.device
+        )
+        return self._scatter_pose_queries(ones, pose_out, num_queries_total)
+
+    def _detrpose_v2_layer_outputs(
+        self, outputs_class: Tensor, pose_out: dict[str, Any]
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Merge the pose stream into the box stream's per-layer outputs.
+
+        Box-stream layer ``l`` is paired with pose-stream layer ``l`` (both have ``dec_layers`` layers). Queries that
+        spawned no pose keep their class logits for other classes; at inference their person logit is pushed down by
+        100 so a person is always reported by a query that carries keypoints.
+
+        Args:
+            outputs_class: Box-stream logits ``[L, B, G * nq, n_cls]``.
+            pose_out: Pose-stream outputs.
+
+        Returns:
+            ``(logits [L, B, G * nq, n_cls], keypoints [L, B, G * nq, K, 8], pose_logits [L, B, G * nq],
+            pose_valid [B, G * nq])``.
+        """
+        assert self.pose_score_weight is not None
+        num_layers, bs, total, _ = outputs_class.shape
+        if pose_out["poses"].shape[0] != num_layers:
+            raise ValueError(
+                f"detrpose_v2 needs as many pose-stream layers as box-stream layers "
+                f"({pose_out['poses'].shape[0]} vs {num_layers})"
+            )
+        keypoints = self._scatter_pose_queries(
+            self._with_extra_channels(pose_out["poses"], pose_out.get("extra")), pose_out, total, layered=True
+        )
+        pose_logits = self._scatter_pose_queries(pose_out["logits"][..., 0], pose_out, total, layered=True)
+        pose_valid = self._pose_valid_mask(pose_out, total)
+        person = self.transformer.pose_class_index
+        person_logit = outputs_class[..., person]
+        # Inference: only pose-carrying queries may report a person (-100 on the others). Training keeps the logits
+        # unmasked and steers person matches to pose-carrying queries with a matching cost instead
+        # (``pose_match_mask``), so an image with more people than candidates does not produce huge class losses.
+        fallback = person_logit if self.training else person_logit - 100.0
+        fused = torch.where(
+            pose_valid.unsqueeze(0),
+            person_logit + self.pose_score_weight.to(person_logit.dtype) * pose_logits.to(person_logit.dtype),
+            fallback,
+        )
+        outputs_class = torch.cat(
+            [outputs_class[..., :person], fused.unsqueeze(-1), outputs_class[..., person + 1 :]], dim=-1
+        )
+        return outputs_class, keypoints, pose_logits, pose_valid
+
+    def _detrpose_v2_training_outputs(self, pose_out: dict[str, Any], pose_valid: Tensor) -> dict[str, Any]:
+        """Training-only pose-stream outputs: the layer-0 ``pre_pose_embed`` head and the CDN reconstruction.
+
+        Args:
+            pose_out: Pose-stream outputs.
+            pose_valid: ``[B, G * nq]`` queries with a pose.
+
+        Returns:
+            ``pose_pre_outputs`` (scattered to the query layout) and, when CDN ran, ``pose_dn``.
+        """
+        total = pose_valid.shape[1]
+        result: dict[str, Any] = {
+            "pose_pre_outputs": {
+                "pred_keypoints": self._scatter_pose_queries(
+                    self._with_extra_channels(pose_out["pre_poses"], None), pose_out, total
+                ),
+                "pose_logits": self._scatter_pose_queries(pose_out["pre_logits"][..., 0], pose_out, total),
+                "pose_valid": pose_valid,
+            }
+        }
+        dn = pose_out.get("dn")
+        if dn is not None:
+            result["pose_dn"] = {
+                "pred_keypoints": self._with_extra_channels(dn["poses"], dn.get("extra")),  # [L, B, pad, K, 8]
+                "pose_logits": dn["logits"][..., 0],  # [L, B, pad]
+                "pre_keypoints": self._with_extra_channels(dn["pre_poses"], None),
+                "pre_logits": dn["pre_logits"][..., 0],
+                "dn_meta": dn["dn_meta"],
+            }
+        return result
 
     def forward_export(self, tensors: Tensor) -> tuple[Tensor, ...]:
         """Run the export graph on a plain image batch.
@@ -651,6 +823,8 @@ class LWDETR(nn.Module):
             ``(boxes, logits)`` for detection, ``(boxes, logits, masks)`` for segmentation, or
             ``(boxes, logits, keypoints)`` for keypoint models.
         """
+        if self.pose_stream_enabled:
+            raise NotImplementedError("keypoint_decoder='detrpose_v2' does not support export yet")
         srcs, _, poss, cross_attn_srcs = self.backbone(tensors)
         # only use one group in inference
         refpoint_embed_weight = self.refpoint_embed.weight[: self.num_queries]
@@ -849,6 +1023,7 @@ def build_model(args: "BuilderArgs") -> LWDETR | tuple[Any, None, None]:
         num_windows=args.num_windows,
         positional_encoding_size=args.positional_encoding_size,
         dual_projector=args.dual_projector,
+        cross_attn_projector_scale=getattr(args, "cross_attn_projector_scale", None),
     )
     if args.encoder_only:
         return backbone[0].encoder, None, None
@@ -902,6 +1077,12 @@ def build_criterion_and_postprocessors(args: "BuilderArgs") -> tuple[SetCriterio
         weight_dict["loss_keypoints_findable"] = getattr(args, "keypoint_findable_loss_coef", 0.0)
         weight_dict["loss_keypoints_visible"] = getattr(args, "keypoint_visible_loss_coef", 0.0)
         weight_dict["loss_keypoints_nll"] = getattr(args, "keypoint_nll_loss_coef", 0.0)
+    pose_stream = has_keypoints and getattr(args, "keypoint_decoder", "grouppose") == "detrpose_v2"
+    if pose_stream:
+        # Original DETRPose weights: loss_vfl 2, loss_keypoints (L1) 10, loss_oks 4. L1 stays RF-DETR's part-weighted
+        # keypoint loss (keypoint_l1_loss_coef); OKS and VFL are added on the pose stream.
+        weight_dict["loss_pose_oks"] = getattr(args, "keypoint_oks_loss_coef", 4.0)
+        weight_dict["loss_pose_vfl"] = getattr(args, "keypoint_vfl_loss_coef", 2.0)
     # TODO this is a hack
     if args.aux_loss:
         aux_weight_dict = {}
@@ -910,12 +1091,22 @@ def build_criterion_and_postprocessors(args: "BuilderArgs") -> tuple[SetCriterio
         if args.two_stage:
             aux_weight_dict.update({k + "_enc": v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
+    if pose_stream:
+        # Pre head (layer 0) and CDN terms are added once, not per layer.
+        weight_dict["loss_pose_oks_pre"] = weight_dict["loss_pose_oks"]
+        weight_dict["loss_pose_vfl_pre"] = weight_dict["loss_pose_vfl"]
+        weight_dict["loss_keypoints_l1_pre"] = weight_dict["loss_keypoints_l1"]
+        weight_dict["loss_pose_dn_oks"] = weight_dict["loss_pose_oks"]
+        weight_dict["loss_pose_dn_vfl"] = weight_dict["loss_pose_vfl"]
+        weight_dict["loss_pose_dn_l1"] = weight_dict["loss_keypoints_l1"]
 
     losses = ["labels", "boxes", "cardinality"]
     if args.segmentation_head:
         losses.append("masks")
     if has_keypoints:
         losses.append("keypoints")
+    if pose_stream:
+        losses.append("pose")
 
     sum_group_losses = getattr(args, "sum_group_losses", False)
     if args.segmentation_head:
@@ -933,6 +1124,10 @@ def build_criterion_and_postprocessors(args: "BuilderArgs") -> tuple[SetCriterio
             mask_point_sample_ratio=args.mask_point_sample_ratio,
             num_keypoints_per_class=getattr(args, "num_keypoints_per_class", []),
             keypoint_loss_weights=getattr(args, "keypoint_loss_weights", None),
+            keypoint_oks_sigmas=getattr(args, "keypoint_oks_sigmas", None),
+            keypoint_famo=getattr(args, "keypoint_famo", False),
+            keypoint_famo_lr=getattr(args, "keypoint_famo_lr", 0.025),
+            keypoint_famo_gamma=getattr(args, "keypoint_famo_gamma", 0.01),
         )
     else:
         criterion = SetCriterion(
@@ -948,6 +1143,10 @@ def build_criterion_and_postprocessors(args: "BuilderArgs") -> tuple[SetCriterio
             ia_bce_loss=args.ia_bce_loss,
             num_keypoints_per_class=getattr(args, "num_keypoints_per_class", []),
             keypoint_loss_weights=getattr(args, "keypoint_loss_weights", None),
+            keypoint_oks_sigmas=getattr(args, "keypoint_oks_sigmas", None),
+            keypoint_famo=getattr(args, "keypoint_famo", False),
+            keypoint_famo_lr=getattr(args, "keypoint_famo_lr", 0.025),
+            keypoint_famo_gamma=getattr(args, "keypoint_famo_gamma", 0.01),
         )
     criterion.to(device)
     postprocess = PostProcess(

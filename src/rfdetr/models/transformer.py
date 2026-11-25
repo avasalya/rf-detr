@@ -1,4 +1,9 @@
 # ------------------------------------------------------------------------
+# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources)
+# Copyright (c) 2026 Ashesh Vasalya (avasalya, asheshvasalya@gmail.com). All Rights Reserved.
+# Adapted from RF-DETR (original notice below). Licensed under the Apache License, Version 2.0
+# ------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # RF-DETR
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
@@ -19,13 +24,14 @@ from __future__ import annotations
 import copy
 import math
 from collections.abc import Callable, Sequence
-from typing import cast
+from typing import Any, cast
 
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
 from rfdetr.models._types import BuilderArgs
+from rfdetr.models.heads.detrpose_v2 import DETRPoseV2Stream
 from rfdetr.models.heads.keypoints import ConditionalQueryInitializer, KeypointGate
 from rfdetr.models.math import MLP
 from rfdetr.models.ops.modules import MSDeformAttn
@@ -263,6 +269,7 @@ class Transformer(nn.Module):
         detrpose_across_topk: int = 100,
         num_registers: int = 0,
         dual_projector_kp_only: bool = False,
+        detrpose_v2: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.encoder = None
@@ -274,11 +281,19 @@ class Transformer(nn.Module):
         self.dual_projector_kp_only = dual_projector_kp_only
         self.num_keypoints_per_class = num_keypoints_per_class or []
         self.num_registers = num_registers
-        if keypoint_decoder not in ("grouppose", "detrpose"):
-            raise ValueError(f"keypoint_decoder must be 'grouppose' or 'detrpose', got {keypoint_decoder!r}")
-        if keypoint_decoder == "detrpose" and use_grouppose_keypoints and not (two_stage and bbox_reparam):
-            raise ValueError("keypoint_decoder='detrpose' requires two_stage=True and bbox_reparam=True")
+        if keypoint_decoder not in ("grouppose", "detrpose", "detrpose_v2"):
+            raise ValueError(
+                f"keypoint_decoder must be 'grouppose', 'detrpose' or 'detrpose_v2', got {keypoint_decoder!r}"
+            )
+        if keypoint_decoder in ("detrpose", "detrpose_v2") and use_grouppose_keypoints and not (
+            two_stage and bbox_reparam
+        ):
+            raise ValueError(f"keypoint_decoder={keypoint_decoder!r} requires two_stage=True and bbox_reparam=True")
         self.keypoint_decoder = keypoint_decoder
+        # detrpose_v2: the box stream is plain RF-DETR (no keypoint block in its layers); poses come from the separate
+        # original-DETRPose stream built below.
+        self.pose_stream_enabled = use_grouppose_keypoints and keypoint_decoder == "detrpose_v2"
+        instance_keypoints = use_grouppose_keypoints and not self.pose_stream_enabled
 
         decoder_layer = TransformerDecoderLayer(
             d_model,
@@ -292,7 +307,7 @@ class Transformer(nn.Module):
             num_feature_levels=num_feature_levels,
             dec_n_points=dec_n_points,
             skip_self_attn=False,
-            enable_keypoint_processing=use_grouppose_keypoints,
+            enable_keypoint_processing=instance_keypoints,
             grouppose_keypoint_dim_downscale=grouppose_keypoint_dim_downscale,
             keypoint_cross_attn=keypoint_cross_attn,
             inter_instance_kp_attn=inter_instance_kp_attn,
@@ -314,7 +329,7 @@ class Transformer(nn.Module):
             d_model=d_model,
             lite_refpoint_refine=lite_refpoint_refine,
             bbox_reparam=bbox_reparam,
-            enable_keypoint_processing=use_grouppose_keypoints,
+            enable_keypoint_processing=instance_keypoints,
             num_keypoints_per_class=self.num_keypoints_per_class,
             grouppose_keypoint_dim_downscale=grouppose_keypoint_dim_downscale,
             keypoint_decoder=keypoint_decoder,
@@ -325,7 +340,7 @@ class Transformer(nn.Module):
             self.enc_output = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(group_detr)])
             self.enc_output_norm = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(group_detr)])
 
-            if use_grouppose_keypoints and self.num_keypoints_per_class:
+            if instance_keypoints and self.num_keypoints_per_class:
                 total_keypoints = sum(self.num_keypoints_per_class)
                 if total_keypoints > 0:
                     keypoint_dim = d_model // grouppose_keypoint_dim_downscale
@@ -340,6 +355,34 @@ class Transformer(nn.Module):
                     )
 
         self._reset_parameters()
+
+        # Built after ``_reset_parameters`` so the original DETRPose initialisation (zero-init heads, Gate, LQE,
+        # deformable offsets) is not overwritten by the generic xavier pass.
+        self.pose_stream: DETRPoseV2Stream | None = None
+        v2 = dict(detrpose_v2 or {})
+        self.pose_spawn_topk = int(v2.pop("spawn_topk", 100))
+        self.pose_spawn_topk_eval = int(v2.pop("spawn_topk_eval", 50))
+        self.pose_class_index = int(v2.pop("class_index", 0))
+        self.ddq = bool(v2.pop("ddq", False))
+        self.ddq_dense_topk = int(v2.pop("ddq_dense_topk", 900))
+        self.ddq_iou_threshold = float(v2.pop("ddq_iou_threshold", 0.8))
+        self.ddq_mode = str(v2.pop("ddq_mode", "box"))
+        if self.ddq_mode not in ("box", "pose"):
+            raise ValueError(f"ddq_mode must be 'box' or 'pose', got {self.ddq_mode!r}")
+        if self.pose_stream_enabled:
+            keypoint_classes = [i for i, n in enumerate(self.num_keypoints_per_class) if n > 0]
+            if len(keypoint_classes) != 1:
+                raise ValueError(
+                    "keypoint_decoder='detrpose_v2' supports exactly one keypoint class (person); "
+                    f"num_keypoints_per_class={self.num_keypoints_per_class}"
+                )
+            self.pose_class_index = keypoint_classes[0]
+            self.pose_stream = DETRPoseV2Stream(
+                hidden_dim=d_model,
+                num_body_points=self.num_keypoints_per_class[self.pose_class_index],
+                num_queries=max(self.pose_spawn_topk, self.pose_spawn_topk_eval),
+                **v2,
+            )
 
         # Register tokens used by GroupPose path.
         if num_registers > 0:
@@ -376,6 +419,129 @@ class Transformer(nn.Module):
         for m in self.modules():
             if isinstance(m, MSDeformAttn):
                 m._reset_parameters()
+
+    def _selection_topk(self) -> int:
+        """Return how many two-stage tokens each group selects (dense when DDQ distinct selection is on).
+
+        Returns:
+            ``ddq_dense_topk`` (at least ``num_queries``) with DDQ, else ``num_queries``.
+        """
+        return max(self.num_queries, self.ddq_dense_topk) if self.ddq else self.num_queries
+
+    def _ddq_subselect(
+        self, refpoint_embed_ts: Tensor, memory_ts: Tensor, boxes_ts: Tensor, cls_ts: Tensor, group_count: int
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """DDQ-style distinct query selection: dense top-k, class-agnostic NMS, keep ``num_queries`` per group.
+
+        Uses matrix "Fast NMS" (YOLACT): a token is suppressed when any higher-scored token of its group overlaps it
+        by more than ``ddq_iou_threshold`` -- box IoU (``ddq_mode='box'``, DDQ DETR) or OKS between the pose stream's
+        initial body poses (``ddq_mode='pose'``). Kept tokens come first in score order, then the suppressed ones,
+        so every group still yields ``num_queries`` queries.
+
+        Args:
+            refpoint_embed_ts: Selected references ``[B, G * dense, 4]`` (score-sorted per group).
+            memory_ts: Selected tokens ``[B, G * dense, C]``.
+            boxes_ts: Undetached two-stage boxes ``[B, G * dense, 4]`` (cxcywh).
+            cls_ts: Two-stage class logits ``[B, G * dense, n_cls]``.
+            group_count: Groups ``G`` in this forward.
+
+        Returns:
+            The four inputs reduced to ``[B, G * num_queries, ...]``.
+        """
+        bs, total, _ = memory_ts.shape
+        dense = total // group_count
+        keep_n = min(self.num_queries, dense)
+        scores = cls_ts.detach().max(-1)[0].view(bs * group_count, dense)
+        with torch.no_grad():
+            if self.ddq_mode == "pose" and self.pose_stream is not None:
+                anchors = boxes_ts.detach().view(bs * group_count, dense, 4)[..., :2].clamp(0, 1)
+                poses = self.pose_stream.initial_poses(memory_ts.detach().view(bs * group_count, dense, -1), anchors)
+                num_body = min(17, poses.shape[2])
+                sigmas = self.pose_stream.oks_sigmas[:num_body]
+                box_wh = boxes_ts.detach().view(bs * group_count, dense, 4)[..., 2:]
+                area = (box_wh[..., 0] * box_wh[..., 1] * 0.53).clamp(min=1e-6)
+                overlaps = []
+                for i in range(bs * group_count):  # [dense, dense, 17] per group keeps memory bounded
+                    body = poses[i, :, :num_body]
+                    d2 = (body[:, None] - body[None]).pow(2).sum(-1)
+                    scale = (area[i][:, None] + area[i][None]) / 2
+                    oks = torch.exp(-d2 / (2 * scale[..., None] * (2 * sigmas) ** 2)).mean(-1)
+                    overlaps.append(oks)
+                overlap = torch.stack(overlaps)
+            else:
+                boxes = boxes_ts.detach().view(bs * group_count, dense, 4)
+                xyxy = torch.cat([boxes[..., :2] - boxes[..., 2:] / 2, boxes[..., :2] + boxes[..., 2:] / 2], dim=-1)
+                lt = torch.maximum(xyxy[:, :, None, :2], xyxy[:, None, :, :2])
+                rb = torch.minimum(xyxy[:, :, None, 2:], xyxy[:, None, :, 2:])
+                inter = (rb - lt).clamp(min=0).prod(-1)
+                area = (xyxy[..., 2:] - xyxy[..., :2]).clamp(min=0).prod(-1)
+                overlap = inter / (area[:, :, None] + area[:, None, :] - inter).clamp(min=1e-9)
+            order = scores.argsort(dim=1, descending=True)
+            overlap = overlap.gather(1, order[..., None].expand(-1, -1, dense)).gather(
+                2, order[:, None, :].expand(-1, dense, -1)
+            )
+            suppressed = (overlap.triu(diagonal=1).amax(dim=1) > self.ddq_iou_threshold)  # by a higher-scored token
+            rank = torch.arange(dense, device=scores.device).expand_as(order)
+            priority = rank + suppressed.long() * dense
+            chosen = order.gather(1, priority.argsort(dim=1)[:, :keep_n])  # [B * G, keep_n] local indices
+        offsets = (torch.arange(group_count, device=chosen.device) * dense).repeat(bs)[:, None]
+        index = (chosen + offsets).view(bs, group_count * keep_n)
+
+        def take(t: Tensor) -> Tensor:
+            return t.gather(1, index[..., None].expand(-1, -1, t.shape[-1]))
+
+        return take(refpoint_embed_ts), take(memory_ts), take(boxes_ts), take(cls_ts)
+
+    def _run_pose_stream(
+        self,
+        memory_ts: Tensor,
+        boxes_ts: Tensor,
+        cls_ts: Tensor,
+        levels: list[Tensor],
+        targets: list[dict[str, Tensor]] | None,
+        image_size: tuple[int, int] | None,
+        group_count: int,
+    ) -> dict[str, Any]:
+        """Spawn pose queries from each group's top-M person candidates and run the DETRPose stream.
+
+        Args:
+            memory_ts: Two-stage selected tokens ``[B, G * nq, C]`` (group-major).
+            boxes_ts: Two-stage boxes ``[B, G * nq, 4]`` (cxcywh); their centres are the pose anchors.
+            cls_ts: Two-stage class logits ``[B, G * nq, n_cls]``; the person column ranks candidates.
+            levels: Pose-stream feature maps (projector #2 levels).
+            targets: Training targets (CDN).
+            image_size: Input ``(H, W)`` in pixels.
+            group_count: Groups ``G`` in this forward.
+
+        Returns:
+            The stream's outputs plus ``candidates [B, G, M]`` (per-group query indices) and ``groups``.
+        """
+        assert self.pose_stream is not None
+        bs, total, dim = memory_ts.shape
+        nq = total // group_count
+        spawn = self.pose_spawn_topk if self.training else self.pose_spawn_topk_eval
+        m = min(spawn, nq)
+        person_logits = cls_ts[..., self.pose_class_index].detach().view(bs, group_count, nq)
+        candidates = person_logits.topk(m, dim=-1)[1]  # [B, G, M], sorted by score
+        cand_memory = memory_ts.view(bs, group_count, nq, dim).gather(2, candidates[..., None].expand(-1, -1, -1, dim))
+        cand_anchor = (
+            boxes_ts.detach()
+            .view(bs, group_count, nq, 4)[..., :2]
+            .gather(2, candidates[..., None].expand(-1, -1, -1, 2))
+            .clamp(0, 1)
+        )
+        out = self.pose_stream(
+            levels,
+            cand_memory.flatten(0, 1),
+            cand_anchor.flatten(0, 1),
+            groups=group_count,
+            targets=targets if self.training else None,
+            image_size=image_size,
+            person_label=self.pose_class_index,
+        )
+        out["candidates"] = candidates
+        out["groups"] = group_count
+        return out
 
     def get_valid_ratio(self, mask: Tensor) -> Tensor:
         _, height, width = mask.shape
@@ -532,7 +698,7 @@ class Transformer(nn.Module):
         bs = output_memory.shape[0]
         class_embeds = cast(Sequence[nn.Linear], self.enc_out_class_embed)
         bbox_mlps = cast(Sequence[MLP], self.enc_out_bbox_embed)
-        topk = min(self.num_queries, output_memory.shape[-2])
+        topk = min(self._selection_topk(), output_memory.shape[-2])
 
         enc_output_weight, enc_output_bias = _stack_linear_params(cast(Sequence[nn.Linear], self.enc_output))
         norm_weight = torch.stack([cast(nn.LayerNorm, m).weight for m in self.enc_output_norm])
@@ -613,7 +779,9 @@ class Transformer(nn.Module):
         refpoint_embed: Tensor,
         query_feat: Tensor,
         cross_attn_srcs: Sequence[Tensor] | None = None,
-    ) -> tuple[Tensor | None, ...]:
+        targets: list[dict[str, Tensor]] | None = None,
+        image_size: tuple[int, int] | None = None,
+    ) -> tuple[Any, ...]:
         """Flatten the multi-scale features, run the two-stage query selection, then the decoder.
 
         Args:
@@ -623,6 +791,8 @@ class Transformer(nn.Module):
             refpoint_embed: Learned reference points, ``(num_queries * group_detr, 4)``.
             query_feat: Learned query features, ``(num_queries * group_detr, d_model)``.
             cross_attn_srcs: Optional separate feature maps for decoder cross-attention.
+            targets: Training targets; ``detrpose_v2`` uses them for pose denoising (CDN).
+            image_size: Input ``(H, W)`` in pixels (``detrpose_v2`` CDN noise scale).
 
         Returns:
             ``(hs, references, memory_ts, boxes_ts)``, followed by ``(keypoint_hs, enc_kp_predictions,
@@ -750,7 +920,7 @@ class Transformer(nn.Module):
                     output_memory_gidx = self.enc_output_norm[g_idx](output_memory_prenorm_gidx)
 
                     enc_outputs_class_unselected_gidx = self.enc_out_class_embed[g_idx](output_memory_gidx)
-                    topk = min(self.num_queries, enc_outputs_class_unselected_gidx.shape[-2])
+                    topk = min(self._selection_topk(), enc_outputs_class_unselected_gidx.shape[-2])
                     topk_proposals_gidx = torch.topk(enc_outputs_class_unselected_gidx.max(-1)[0], topk, dim=1)[
                         1
                     ]  # bs, nq
@@ -813,6 +983,33 @@ class Transformer(nn.Module):
                 # fallback (custom/heterogeneous group modules, or group_detr==1) is left as is; the
                 # caller re-runs enc_out_class_embed for this case, same as before this change.
                 cls_ts = None
+
+            if (self.pose_stream_enabled or self.ddq) and cls_ts is None:
+                cls_ts = torch.cat(
+                    [
+                        self.enc_out_class_embed[g_idx](chunk)
+                        for g_idx, chunk in enumerate(memory_ts.chunk(group_detr, dim=1))
+                    ],
+                    dim=1,
+                )
+            if self.ddq:
+                assert cls_ts is not None
+                refpoint_embed_ts, memory_ts, boxes_ts, cls_ts = self._ddq_subselect(
+                    refpoint_embed_ts, memory_ts, boxes_ts, cls_ts, group_detr
+                )
+
+        pose_outputs: dict[str, Any] | None = None
+        if self.pose_stream_enabled:
+            assert self.two_stage and cls_ts is not None
+            pose_outputs = self._run_pose_stream(
+                memory_ts,
+                boxes_ts,
+                cls_ts,
+                list(cross_attn_srcs) if cross_attn_srcs is not None else list(srcs),
+                targets,
+                image_size,
+                group_detr,
+            )
 
         enc_kp_predictions = None
         init_kp_ref_xy = None
@@ -883,7 +1080,7 @@ class Transformer(nn.Module):
                     init_kp_ref_xy = torch.cat([torch.cat([chunk, reg_kp_xy], dim=1) for chunk in kp_ref_chunks], dim=1)
 
             tgt_keypoints = None
-            if self.use_grouppose_keypoints:
+            if self.use_grouppose_keypoints and not self.pose_stream_enabled:
                 if not hasattr(self, "keypoint_query_initializer"):
                     raise ValueError("use_grouppose_keypoints=True requires keypoint initializers")
                 tgt_keypoints = self.keypoint_query_initializer(tgt)
@@ -960,7 +1157,10 @@ class Transformer(nn.Module):
         else:
             return_values.extend([None, None])
 
-        if self.use_grouppose_keypoints:
+        if self.pose_stream_enabled:
+            # detrpose_v2: one dict with the pose stream's per-layer outputs, spawn indices and CDN outputs.
+            return_values.append(pose_outputs)
+        elif self.use_grouppose_keypoints:
             return_values.append(keypoint_hs)
             return_values.append(enc_kp_predictions)
             return_values.append(keypoint_memory_ts if self.two_stage else None)
@@ -1746,7 +1946,48 @@ def build_transformer(args: BuilderArgs) -> Transformer:
         detrpose_across_topk=getattr(args, "detrpose_across_topk", 100),
         num_registers=getattr(args, "num_decoder_registers", 0),
         dual_projector_kp_only=getattr(args, "dual_projector_kp_only", False),
+        detrpose_v2=_detrpose_v2_kwargs(args) if getattr(args, "keypoint_decoder", "grouppose") == "detrpose_v2" else None,
     )
+
+
+def _detrpose_v2_kwargs(args: BuilderArgs) -> dict[str, Any]:
+    """Build ``Transformer(detrpose_v2=...)`` from ``ModelConfig.detrpose_v2`` plus the shared model fields.
+
+    The pose stream gets as many layers as the box stream (``dec_layers``; layer ``l`` of both streams forms
+    ``aux_outputs[l]``), one level per projector-#2 scale, and the training OKS sigmas for CDN noise.
+
+    Args:
+        args: Builder namespace.
+
+    Returns:
+        Keyword arguments for :class:`~rfdetr.models.heads.detrpose_v2.DETRPoseV2Stream` plus the spawn/DDQ options
+        consumed by :class:`Transformer`.
+    """
+    options = dict(getattr(args, "detrpose_v2", None) or {})
+    levels = getattr(args, "cross_attn_projector_scale", None) or args.projector_scale
+    if not getattr(args, "dual_projector", False):
+        raise ValueError("keypoint_decoder='detrpose_v2' needs dual_projector=True (its memory is projector #2)")
+    kwargs: dict[str, Any] = {
+        "num_decoder_layers": args.dec_layers,
+        "num_feature_levels": len(levels),
+        "nhead": int(options.pop("heads", 8)),
+        "dec_n_points": int(options.pop("points", 4)),
+        "dim_feedforward": int(options.pop("dim_feedforward", 1024)),
+        "reg_max": int(options.pop("reg_max", 32)),
+        "reg_scale": float(options.pop("reg_scale", 4.0)),
+        "dn_number": int(options.pop("dn_number", 20)),
+        "dn_label_noise_ratio": float(options.pop("dn_label_noise_ratio", 0.5)),
+        "extra_heads": bool(options.pop("extra_heads", True)),
+        "learnable_tgt_init": bool(options.pop("learnable_tgt_init", True)),
+        "activation_checkpointing": bool(options.pop("activation_checkpointing", False)),
+        "oks_sigmas": getattr(args, "keypoint_oks_sigmas", None),
+    }
+    for key in ("spawn_topk", "spawn_topk_eval", "ddq", "ddq_dense_topk", "ddq_iou_threshold", "ddq_mode"):
+        if key in options:
+            kwargs[key] = options.pop(key)
+    if options:
+        raise ValueError(f"unknown detrpose_v2 options: {sorted(options)}")
+    return kwargs
 
 
 #: Functional activation per name accepted by the transformer layers.

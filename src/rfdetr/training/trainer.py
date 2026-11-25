@@ -1,4 +1,9 @@
 # ------------------------------------------------------------------------
+# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources)
+# Copyright (c) 2026 Ashesh Vasalya (avasalya, asheshvasalya@gmail.com). All Rights Reserved.
+# Adapted from RF-DETR (original notice below). Licensed under the Apache License, Version 2.0
+# ------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # RF-DETR
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
@@ -46,6 +51,8 @@ from rfdetr.training.callbacks import (
     RFDETREMACallback,
 )
 from rfdetr.training.callbacks.coco_eval import COCOEvalCallback
+from rfdetr.training.callbacks.lr_plateau import PlateauLRScaleCallback
+from rfdetr.training.callbacks.resolution_schedule import ResolutionScheduleCallback
 from rfdetr.utilities.logger import get_logger
 
 _logger = get_logger()
@@ -327,6 +334,8 @@ def _preserve_csv_history_across_resume(csv_logger: CSVLogger, output_dir: str |
 _BEST_MODEL_MONITOR_KEYS: dict[str, tuple[str, str, str]] = {
     "map": ("keypoint_map_50_95", "segm_mAP_50_95", "mAP_50_95"),
     "mar": ("keypoint_mAR", "mAR", "mAR"),
+    "map_weighted": ("keypoint_map_weighted", "segm_mAP_50_95", "mAP_50_95"),
+    "map_weighted_pareto": ("keypoint_map_weighted_pareto", "segm_mAP_50_95", "mAP_50_95"),
 }
 
 
@@ -440,6 +449,26 @@ def _append_training_callbacks(
             smooth_alpha=best_model_smooth_alpha,
         )
     )
+
+    # flat_cosine + plateau: scale the LR curve down when the best-model metric stalls.
+    if isinstance(tc.lr_scheduler, str) and tc.lr_scheduler.strip().lower() in ("flat_cosine", "adaptive"):
+        kwargs = tc.lr_scheduler_kwargs
+        patience = int(kwargs.get("plateau_patience", 0))
+        if patience > 0:
+            callbacks.append(
+                PlateauLRScaleCallback(
+                    monitor=monitor_ema or monitor_regular,
+                    patience=patience,
+                    factor=float(kwargs.get("plateau_factor", 0.3)),
+                    min_scale=float(kwargs.get("plateau_min_scale", 0.01)),
+                    min_delta=float(kwargs.get("plateau_min_delta", 0.001)),
+                    transition_epochs=float(kwargs.get("plateau_transition_epochs", 3.0)),
+                )
+            )
+
+    # Progressive resizing (e.g. {10: 672}).
+    if tc.resolution_schedule:
+        callbacks.append(ResolutionScheduleCallback(tc.resolution_schedule, model_config.resolution))
 
     # Optional early stopping.
     if tc.early_stopping:
@@ -937,6 +966,8 @@ def build_trainer(
             log_per_class_metrics=tc.log_per_class_metrics,
             eval_backend=tc.eval_backend,
             keypoint_oks_sigmas=tc.keypoint_oks_sigmas,
+            keypoint_part_weights=tc.keypoint_part_weights if tc.keypoint_part_metrics else None,
+            keypoint_pareto_parts=tc.keypoint_pareto_parts if tc.keypoint_part_metrics else None,
             eval_base_model=tc.eval_base_model,
         )
     )

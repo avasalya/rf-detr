@@ -1,4 +1,9 @@
 # ------------------------------------------------------------------------
+# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources)
+# Copyright (c) 2026 Ashesh Vasalya (avasalya, asheshvasalya@gmail.com). All Rights Reserved.
+# Adapted from RF-DETR (original notice below). Licensed under the Apache License, Version 2.0
+# ------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # RF-DETR
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
@@ -303,6 +308,92 @@ def _instantiate_explicit_scheduler(
         ) from exc
 
 
+class FlatCosineLambda:
+    """Warmup → flat → cosine LR factor (DEIM ``FlatCosine`` / RTMO style), times a plateau scale.
+
+    ``scale`` is lowered by :class:`~rfdetr.training.callbacks.lr_plateau.PlateauLRScaleCallback` when the monitored
+    validation metric stalls. ``LambdaLR.state_dict`` stores this object's ``__dict__``, so the scale survives resume.
+
+    Examples:
+        >>> f = FlatCosineLambda(warmup_steps=10, total_steps=100, flat_ratio=0.5, min_factor=0.1)
+        >>> f(5), f(40), round(f(100), 3)
+        (0.5, 1.0, 0.1)
+    """
+
+    def __init__(self, warmup_steps: int, total_steps: int, flat_ratio: float, min_factor: float) -> None:
+        self.warmup_steps = int(warmup_steps)
+        self.total_steps = int(total_steps)
+        self.flat_ratio = float(flat_ratio)
+        self.min_factor = float(min_factor)
+        self.scale = 1.0
+
+    def __call__(self, current_step: int) -> float:
+        if current_step < self.warmup_steps:
+            base = float(current_step) / float(max(1, self.warmup_steps))
+        else:
+            flat_end = max(self.warmup_steps, int(self.total_steps * self.flat_ratio))
+            if current_step < flat_end:
+                base = 1.0
+            else:
+                progress = min(1.0, float(current_step - flat_end) / float(max(1, self.total_steps - flat_end)))
+                base = self.min_factor + (1 - self.min_factor) * 0.5 * (1 + math.cos(math.pi * progress))
+        return base * self.scale
+
+
+class AdaptiveDecayLambda:
+    """Performance-driven LR factor without a fixed run length (``lr_scheduler: adaptive``).
+
+    ``factor(step) = warmup(step) * 0.5 ** (max(0, step - warmup) / half_life) * scale(step)``, floored at
+    ``min_factor`` after warmup. ``warmup`` is a half-cosine ramp (smooth start); ``scale`` changes only through
+    :meth:`begin_decay`, which :class:`~rfdetr.training.callbacks.lr_plateau.PlateauLRScaleCallback` calls when the
+    monitored metric stalls: the scale then moves from its current value to ``target`` along a half cosine over
+    ``transition_steps``, so the LR never jumps. ``LambdaLR.state_dict`` stores ``__dict__``, so it survives resume.
+
+    Examples:
+        >>> f = AdaptiveDecayLambda(warmup_steps=10, steps_per_epoch=10, half_life_epochs=0, min_factor=0.01)
+        >>> round(f(5), 3), f(10), f(50)
+        (0.5, 1.0, 1.0)
+        >>> f.begin_decay(step=50, factor=0.5, transition_steps=20, min_scale=0.01)
+        >>> round(f(60), 3), f(70), f(100)
+        (0.75, 0.5, 0.5)
+    """
+
+    def __init__(self, warmup_steps: int, steps_per_epoch: int, half_life_epochs: float, min_factor: float) -> None:
+        self.warmup_steps = int(warmup_steps)
+        self.steps_per_epoch = max(1, int(steps_per_epoch))
+        self.half_life_steps = float(half_life_epochs) * self.steps_per_epoch
+        self.min_factor = float(min_factor)
+        self.scale_from = 1.0
+        self.scale_to = 1.0
+        self.transition_start = 0
+        self.transition_steps = 0
+        self.decays = 0
+
+    def scale(self, step: int) -> float:
+        """Current plateau scale (half-cosine interpolation inside a transition)."""
+        if self.transition_steps <= 0 or step >= self.transition_start + self.transition_steps:
+            return self.scale_to
+        if step <= self.transition_start:
+            return self.scale_from
+        progress = (step - self.transition_start) / self.transition_steps
+        return self.scale_to + (self.scale_from - self.scale_to) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    def begin_decay(self, step: int, factor: float, transition_steps: int, min_scale: float) -> None:
+        """Start a smooth transition of the scale to ``scale * factor`` (floored at ``min_scale``)."""
+        current = self.scale(step)
+        self.scale_from = current
+        self.scale_to = max(float(min_scale), current * float(factor))
+        self.transition_start = int(step)
+        self.transition_steps = max(1, int(transition_steps))
+        self.decays += 1
+
+    def __call__(self, current_step: int) -> float:
+        if current_step < self.warmup_steps:
+            return 0.5 * (1 - math.cos(math.pi * current_step / max(1, self.warmup_steps)))
+        decay = 0.5 ** ((current_step - self.warmup_steps) / self.half_life_steps) if self.half_life_steps > 0 else 1.0
+        return max(self.min_factor, decay * self.scale(current_step))
+
+
 def _build_managed_scheduler(
     optimizer: torch.optim.Optimizer,
     train_config: TrainConfig,
@@ -328,10 +419,32 @@ def _build_managed_scheduler(
         A ``LambdaLR`` implementing the managed schedule.
     """
     kwargs = train_config.lr_scheduler_kwargs
-    # Managed presets are always strings (guaranteed by the _is_managed_scheduler_name branch at the call site).
     preset = cast(str, train_config.lr_scheduler).strip().lower()
     min_factor = float(kwargs.get("min_factor", _MANAGED_SCHEDULER_DEFAULTS["min_factor"]))
     lr_drop = int(kwargs.get("lr_drop", _MANAGED_SCHEDULER_DEFAULTS["lr_drop"]))
+
+    if preset == "adaptive":
+        return torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=AdaptiveDecayLambda(
+                warmup_steps=warmup_steps,
+                steps_per_epoch=steps_per_epoch,
+                half_life_epochs=float(
+                    kwargs.get("decay_half_life_epochs", _MANAGED_SCHEDULER_DEFAULTS["decay_half_life_epochs"])
+                ),
+                min_factor=min_factor,
+            ),
+        )
+    if preset == "flat_cosine":
+        return torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=FlatCosineLambda(
+                warmup_steps=warmup_steps,
+                total_steps=total_steps,
+                flat_ratio=float(kwargs.get("flat_ratio", _MANAGED_SCHEDULER_DEFAULTS["flat_ratio"])),
+                min_factor=min_factor,
+            ),
+        )
 
     def lr_lambda(current_step: int) -> float:
         if current_step < warmup_steps:
@@ -339,7 +452,7 @@ def _build_managed_scheduler(
         if preset == "cosine":
             progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
             return min_factor + (1 - min_factor) * 0.5 * (1 + math.cos(math.pi * progress))
-        # Step decay: drop by 10x after lr_drop epochs.
+        # step
         if current_step < lr_drop * steps_per_epoch:
             return 1.0
         return 0.1

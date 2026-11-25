@@ -1,4 +1,9 @@
 # ------------------------------------------------------------------------
+# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources)
+# Copyright (c) 2026 Ashesh Vasalya (avasalya, asheshvasalya@gmail.com). All Rights Reserved.
+# Adapted from RF-DETR (original notice below). Licensed under the Apache License, Version 2.0
+# ------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # RF-DETR
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
@@ -43,6 +48,8 @@ class BuilderArgs(Protocol):
     inter_instance_kp_attn: bool
     keypoint_decoder: str
     detrpose_across_topk: int
+    detrpose_v2: dict[str, object]
+    cross_attn_projector_scale: list[str] | None
     grouppose_keypoint_dim_downscale: int
     dual_projector: bool
     dual_projector_kp_only: bool

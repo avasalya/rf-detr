@@ -1,4 +1,9 @@
 # ------------------------------------------------------------------------
+# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources)
+# Copyright (c) 2026 Ashesh Vasalya (avasalya, asheshvasalya@gmail.com). All Rights Reserved.
+# Adapted from RF-DETR (original notice below). Licensed under the Apache License, Version 2.0
+# ------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # RF-DETR
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
@@ -81,6 +86,7 @@ def build_backbone(
     num_windows: int,
     positional_encoding_size: int,
     dual_projector: bool = False,
+    cross_attn_projector_scale: list[Any] | None = None,
 ) -> Joiner:
     """
     Useful args:
@@ -112,6 +118,7 @@ def build_backbone(
         num_windows=num_windows,
         positional_encoding_size=positional_encoding_size,
         dual_projector=dual_projector,
+        cross_attn_projector_scale=cross_attn_projector_scale,
     )
 
     model = Joiner(backbone, position_embedding_module)

@@ -1,4 +1,9 @@
 # ------------------------------------------------------------------------
+# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources)
+# Copyright (c) 2026 Ashesh Vasalya (avasalya, asheshvasalya@gmail.com). All Rights Reserved.
+# Adapted from RF-DETR (original notice below). Licensed under the Apache License, Version 2.0
+# ------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # RF-DETR
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
@@ -78,6 +83,7 @@ def _make_synthetic_batch(
     segmentation_head: bool = False,
     max_targets_per_image: int = 1,
     num_channels: int = 3,
+    num_keypoints: int = 0,
 ) -> tuple[NestedTensor, list[dict[str, torch.Tensor]]]:
     """Build a minimal (samples, targets) batch for probing.
 
@@ -108,6 +114,11 @@ def _make_synthetic_batch(
         }
         if segmentation_head:
             t["masks"] = torch.zeros(n, resolution, resolution, dtype=torch.bool, device=device)
+        if num_keypoints > 0:
+            # Every keypoint labelled and visible: the worst case for keypoint losses and pose denoising queries.
+            keypoints = torch.rand(n, num_keypoints, 3, device=device) * 0.2 + 0.4
+            keypoints[..., 2] = 2.0
+            t["keypoints"] = keypoints
         targets.append(t)
     return samples, targets
 
@@ -231,6 +242,7 @@ def _probe_step(
     num_channels: int = 3,
     autocast_dtype: torch.dtype | None = None,
     warn_missing_grads: bool = False,
+    num_keypoints: int = 0,
 ) -> bool:
     """Run one forward + loss + backward + shadow optimizer step; return True if successful, False on OOM.
 
@@ -282,6 +294,7 @@ def _probe_step(
             segmentation_head=segmentation_head,
             max_targets_per_image=max_targets_per_image,
             num_channels=num_channels,
+            num_keypoints=num_keypoints,
         )
 
         autocast_kwargs: dict[str, Any] = {"device_type": "cuda", "enabled": amp}
@@ -353,6 +366,7 @@ def probe_max_micro_batch(
     optimizer_weight_decay: float = 1e-4,
     optimizer_kwargs: dict[str, Any] | None = None,
     optimizer_fused: bool | None = None,
+    num_keypoints: int = 0,
 ) -> int:
     """Find the largest per-device batch size that fits in memory for one train step.
 
@@ -457,6 +471,7 @@ def probe_max_micro_batch(
                 num_channels=num_channels,
                 autocast_dtype=autocast_dtype,
                 warn_missing_grads=warn_missing_grads,
+                num_keypoints=num_keypoints,
             )
             if ok:
                 warn_missing_grads = False
@@ -598,20 +613,22 @@ def resolve_auto_batch_config(
     # Both "batch" and "sample" modes can hit the largest scale, so probe it for either.
     # The probe is square; with square_resize_div_64=False the aspect-preserving resize lets the long side reach
     # 1333 px and collate pads per axis, so a mixed portrait/landscape batch can exceed this probe's footprint.
+    # Largest resolution the run reaches (resolution_schedule switches it up later, e.g. 576 -> 672).
+    base_resolution = max([model_config.resolution, *(getattr(train_config, "resolution_schedule", None) or {}).values()])
     multi_scale = MultiScale.from_value(getattr(train_config, "multi_scale", False))
     if multi_scale is not MultiScale.OFF:
         expanded_scales = getattr(train_config, "expanded_scales", True)
         patch_size = getattr(model_config, "patch_size", 14)
         num_windows = getattr(model_config, "num_windows", 4)
         scales = compute_multi_scale_scales(
-            model_config.resolution,
+            base_resolution,
             expanded_scales,
             patch_size,
             num_windows,
         )
-        probe_resolution = max(scales) if scales else model_config.resolution
+        probe_resolution = max(scales) if scales else base_resolution
     else:
-        probe_resolution = model_config.resolution
+        probe_resolution = base_resolution
 
     max_targets_per_image = getattr(train_config, "auto_batch_max_targets_per_image", 100)
     pad_targets_to = getattr(train_config, "pad_targets_to", None)
@@ -695,6 +712,11 @@ def resolve_auto_batch_config(
         autocast_dtype=probe_autocast_dtype,
         optimizer_kwargs=shadow_optimizer_kwargs,
         optimizer_fused=use_fused_optimizer,
+        num_keypoints=(
+            max(getattr(model_config, "num_keypoints_per_class", None) or [0])
+            if getattr(model_config, "use_grouppose_keypoints", False)
+            else 0
+        ),
     )
 
     use_ema = getattr(train_config, "use_ema", False)

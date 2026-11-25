@@ -1,4 +1,9 @@
 # ------------------------------------------------------------------------
+# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources)
+# Copyright (c) 2026 Ashesh Vasalya (avasalya, asheshvasalya@gmail.com). All Rights Reserved.
+# Adapted from RF-DETR (original notice below). Licensed under the Apache License, Version 2.0
+# ------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # RF-DETR
 # Copyright (c) 2025 Roboflow. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
@@ -224,6 +229,8 @@ class TestSetup:
             "eval_ema_only",
             "eval_base_model",
             "eval_backend",
+            "keypoint_part_weights",
+            "keypoint_pareto_parts",
         ]
 
     def test_log_per_class_metrics_default_keeps_class_metrics_compute(self) -> None:
@@ -1225,7 +1232,9 @@ class TestKeypointCocoEvalRouting:
             result = cb._get_or_create_keypoint_oks_metric(trainer, split="val")
 
         assert result is oks_metric_cls.return_value
-        oks_metric_cls.assert_called_once_with(coco_api, keypoint_oks_sigmas=[0.05], max_dets=500)
+        oks_metric_cls.assert_called_once_with(
+            coco_api, keypoint_oks_sigmas=[0.05], max_dets=500, part_weights=None, pareto_parts=None
+        )
 
     def test_keypoint_train_eval_uses_train_dataset(self) -> None:
         """Train keypoint mAP must construct MetricKeypointOKS from the train dataset."""
