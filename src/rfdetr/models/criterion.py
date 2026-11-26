@@ -1221,7 +1221,8 @@ class SetCriterion(nn.Module):
             positive = torch.zeros_like(pose_valid)
             target_score = torch.zeros_like(pose_logits, dtype=torch.float32)
             participating = pose_valid.clone()
-            batch_idx, query_idx = src_idx
+            # matcher indices live on the CPU, the masks below on the pose tensors' device
+            batch_idx, query_idx = (i.to(pose_valid.device) for i in src_idx)
             positive[batch_idx[use], query_idx[use]] = True
             target_score[batch_idx[use], query_idx[use]] = oks.detach()[use]
             # A matched person without labelled keypoints (box-only source) has no OKS target: ignore its query.
