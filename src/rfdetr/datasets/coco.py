@@ -1,5 +1,6 @@
 # ------------------------------------------------------------------------
-# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources)
+# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources) and per-source
+#   train annotation manifests
 # Copyright (c) 2026 Ashesh Vasalya (avasalya, asheshvasalya@gmail.com). All Rights Reserved.
 # Adapted from RF-DETR (original notice below). Licensed under the Apache License, Version 2.0
 # ------------------------------------------------------------------------
@@ -48,6 +49,7 @@ from rfdetr.datasets._torchvision import (
     Resize,
 )
 from rfdetr.datasets.aug_configs import AUG_CONFIG
+from rfdetr.datasets.coco_manifest import MANIFEST_NAME, is_manifest, load_manifest_coco
 from rfdetr.datasets.io_utils import decode_image
 from rfdetr.datasets.kornia_transforms import is_gpu_postprocess, resolve_backend_for_build
 from rfdetr.datasets.transforms import AlbumentationsWrapper, Normalize
@@ -691,7 +693,13 @@ class CocoDetection(torchvision.datasets.CocoDetection):  # type: ignore[misc]
         cat2label: dict[int, int] | None = None,
         draft_size: int | None = None,
     ) -> None:
-        super().__init__(img_folder, ann_file)
+        if is_manifest(ann_file):
+            # per-source files listed in annotations/train/manifest.json, merged into one COCO index
+            torchvision.datasets.VisionDataset.__init__(self, str(img_folder))
+            self.coco = load_manifest_coco(ann_file)
+            self.ids = sorted(self.coco.imgs.keys())
+        else:
+            super().__init__(img_folder, ann_file)
         self._transforms = transforms
         self._draft_size = draft_size
         self.include_masks = include_masks
@@ -1507,8 +1515,15 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
         "train": root / "annotations" / "coco_wholebody_train_v1.0.json",
         "val": root / "annotations" / "coco_wholebody_val_v1.0.json",
     }
+    train_manifest = root / "annotations" / "train" / MANIFEST_NAME  # per-source train files (build_wholebody_ext)
+    if has_keypoints and train_manifest.exists():
+        train_ann = train_manifest
+    elif has_keypoints and wholebody_paths["train"].exists():
+        train_ann = wholebody_paths["train"]
+    else:
+        train_ann = root / "annotations" / f"{mode}_train2017.json"
     PATHS = {  # noqa: N806
-        "train": (root / "train2017", wholebody_paths["train"] if has_keypoints and wholebody_paths["train"].exists() else root / "annotations" / f"{mode}_train2017.json"),
+        "train": (root / "train2017", train_ann),
         "val": (root / "val2017", wholebody_paths["val"] if has_keypoints and wholebody_paths["val"].exists() else root / "annotations" / f"{mode}_val2017.json"),
         "test": (root / "test2017", root / "annotations" / "image_info_test-dev2017.json"),
     }

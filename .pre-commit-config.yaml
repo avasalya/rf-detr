@@ -82,7 +82,7 @@ repos:
       - id: insert-license
         files: \.py$
         # Files written for COMET3D keep their own copyright header; the hook must not add Roboflow's.
-        exclude: ^(notebooks|docs)/|^src/rfdetr/models/heads/detrpose_v2\.py$|^src/rfdetr/training/callbacks/(lr_plateau|resolution_schedule)\.py$|^tests/models/test_detrpose_v2_(parity|model)\.py$
+        exclude: ^(notebooks|docs)/|^src/rfdetr/models/heads/detrpose_v2\.py$|^src/rfdetr/training/callbacks/(lr_plateau|resolution_schedule)\.py$|^tests/models/test_detrpose_v2_(parity|model)\.py$|^src/rfdetr/datasets/coco_manifest\.py$|^tests/datasets/test_coco_manifest\.py$
         args:
           - --license-filepath
           - .github/LICENSE_HEADER.txt
