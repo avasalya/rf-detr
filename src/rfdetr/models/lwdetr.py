@@ -693,11 +693,14 @@ class LWDETR(nn.Module):
             extra: ``[..., 6]`` findable, visible, Cholesky ×3 and class-contribution channels, or ``None``.
 
         Returns:
-            ``[..., 8]`` keypoints in the layout ``compute_l1_keypoint_loss`` and ``PostProcess`` expect.
+            ``[..., 8]`` float32 keypoints in the layout ``compute_l1_keypoint_loss`` and ``PostProcess`` expect
+            (float32 like the box stream: under bf16 autocast the pose stream returns bf16, which is too coarse for
+            coordinates and breaks ``PostProcess``'s float32 index writes).
         """
+        poses = poses.float()
         if extra is None:
             extra = poses.new_zeros(*poses.shape[:-1], 6)
-        return torch.cat([poses, extra.to(poses.dtype)], dim=-1)
+        return torch.cat([poses, extra.float()], dim=-1)
 
     @staticmethod
     def _scatter_pose_queries(
@@ -755,6 +758,7 @@ class LWDETR(nn.Module):
             pose_valid [B, G * nq])``.
         """
         assert self.pose_score_weight is not None
+        outputs_class = outputs_class.float()  # float32 like the keypoints (PostProcess writes float32 fused scores)
         num_layers, bs, total, _ = outputs_class.shape
         if pose_out["poses"].shape[0] != num_layers:
             raise ValueError(
@@ -764,7 +768,7 @@ class LWDETR(nn.Module):
         keypoints = self._scatter_pose_queries(
             self._with_extra_channels(pose_out["poses"], pose_out.get("extra")), pose_out, total, layered=True
         )
-        pose_logits = self._scatter_pose_queries(pose_out["logits"][..., 0], pose_out, total, layered=True)
+        pose_logits = self._scatter_pose_queries(pose_out["logits"][..., 0].float(), pose_out, total, layered=True)
         pose_valid = self._pose_valid_mask(pose_out, total)
         person = self.transformer.pose_class_index
         person_logit = outputs_class[..., person]
@@ -774,7 +778,7 @@ class LWDETR(nn.Module):
         fallback = person_logit if self.training else person_logit - 100.0
         fused = torch.where(
             pose_valid.unsqueeze(0),
-            person_logit + self.pose_score_weight.to(person_logit.dtype) * pose_logits.to(person_logit.dtype),
+            person_logit + self.pose_score_weight.float() * pose_logits,
             fallback,
         )
         outputs_class = torch.cat(
@@ -798,7 +802,7 @@ class LWDETR(nn.Module):
                 "pred_keypoints": self._scatter_pose_queries(
                     self._with_extra_channels(pose_out["pre_poses"], None), pose_out, total
                 ),
-                "pose_logits": self._scatter_pose_queries(pose_out["pre_logits"][..., 0], pose_out, total),
+                "pose_logits": self._scatter_pose_queries(pose_out["pre_logits"][..., 0].float(), pose_out, total),
                 "pose_valid": pose_valid,
             }
         }
@@ -806,9 +810,9 @@ class LWDETR(nn.Module):
         if dn is not None:
             result["pose_dn"] = {
                 "pred_keypoints": self._with_extra_channels(dn["poses"], dn.get("extra")),  # [L, B, pad, K, 8]
-                "pose_logits": dn["logits"][..., 0],  # [L, B, pad]
+                "pose_logits": dn["logits"][..., 0].float(),  # [L, B, pad]
                 "pre_keypoints": self._with_extra_channels(dn["pre_poses"], None),
-                "pre_logits": dn["pre_logits"][..., 0],
+                "pre_logits": dn["pre_logits"][..., 0].float(),
                 "dn_meta": dn["dn_meta"],
             }
         return result

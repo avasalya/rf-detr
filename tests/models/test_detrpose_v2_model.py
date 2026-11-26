@@ -15,6 +15,7 @@ import torch
 from rfdetr.models.criterion import SetCriterion
 from rfdetr.models.lwdetr import LWDETR
 from rfdetr.models.matcher import HungarianMatcher
+from rfdetr.models.postprocess import PostProcess
 from rfdetr.models.transformer import Transformer
 from rfdetr.training.callbacks.resolution_schedule import resolution_for_epoch
 from rfdetr.training.module_model import FlatCosineLambda
@@ -145,6 +146,16 @@ class TestOutputs:
             out = model(_samples())
         xy = out["pred_keypoints"][out["pose_valid"]][..., :2]
         assert torch.isfinite(xy).all() and (xy > -0.5).all() and (xy < 1.5).all()
+
+    def test_bf16_autocast_eval_outputs_float32_and_postprocesses(self) -> None:
+        # Regression: validation under bf16 autocast crashed in PostProcess._apply_keypoint_trace_fusion
+        # ("Index put requires the source and destination dtypes match ... BFloat16 ... Float").
+        model = _build().eval()
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+            out = model(_samples())
+            results = PostProcess(num_select=NQ, num_keypoints_per_class=[K])(out, torch.tensor([[64, 64]] * B))
+        assert out["pred_keypoints"].dtype == torch.float32
+        assert len(results) == B and results[0]["keypoints"].shape[-2] == K
 
     @pytest.mark.parametrize("mode", ["box", "pose"])
     def test_ddq_selection_keeps_query_count(self, mode: str) -> None:
