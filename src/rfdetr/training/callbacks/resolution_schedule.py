@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import gc
 from typing import Any
 
 import pytorch_lightning as pl
@@ -15,6 +16,27 @@ from pytorch_lightning.callbacks import Callback
 from rfdetr.utilities.logger import get_logger
 
 logger = get_logger()
+
+
+def shutdown_workers(combined_loader: Any) -> int:
+    """Stop the worker processes of every DataLoader in a Lightning ``CombinedLoader`` (``None``: nothing to do).
+
+    Persistent workers (``persistent_workers=True``) outlive the DataLoader's epoch and are only stopped when the
+    DataLoader is garbage collected, which Lightning's remaining references can delay past the creation of new ones.
+
+    Returns:
+        Number of DataLoaders whose workers were stopped.
+    """
+    if combined_loader is None:
+        return 0
+    stopped = 0
+    for loader in getattr(combined_loader, "flattened", []):
+        iterator = getattr(loader, "_iterator", None)
+        if iterator is not None and hasattr(iterator, "_shutdown_workers"):
+            iterator._shutdown_workers()
+            loader._iterator = None
+            stopped += 1
+    return stopped
 
 
 def resolution_for_epoch(schedule: dict[int, int], epoch: int, default: int) -> int:
@@ -60,8 +82,13 @@ class ResolutionScheduleCallback(Callback):
         module_config = getattr(pl_module, "model_config", None)
         if module_config is not None and module_config is not datamodule.model_config:
             module_config.resolution = resolution
+        # Stop the old persistent workers first: each holds a copy of the dataset, and they would otherwise live on
+        # next to the new ones (2x host RAM per node at the switch; a 2-node wholebody_ext_v2 job was OOM-killed).
+        for loop in (trainer.fit_loop, trainer.fit_loop.epoch_loop.val_loop):
+            shutdown_workers(loop._combined_loader)
         datamodule._dataset_train = None
         datamodule._dataset_val = None
+        gc.collect()
         datamodule.setup("fit")
         # Force Lightning to rebuild both dataloaders (and the distributed samplers) at the next epoch start.
         trainer.fit_loop._combined_loader = None
