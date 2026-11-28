@@ -1,6 +1,6 @@
 # ------------------------------------------------------------------------
-# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources) and per-source
-#   train annotation manifests
+# COMET3D: modified for detrpose_v2 (pose stream, part metrics, adaptive LR, FAMO, auto resources), per-source
+#   train annotation manifests and serialized train annotations
 # Copyright (c) 2026 Ashesh Vasalya (avasalya, asheshvasalya@gmail.com). All Rights Reserved.
 # Adapted from RF-DETR (original notice below). Licensed under the Apache License, Version 2.0
 # ------------------------------------------------------------------------
@@ -25,11 +25,15 @@ Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references
 
 from __future__ import annotations
 
+import gc
 import json
-from collections.abc import Mapping
+import pickle
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, cast
 
+import numpy as np
 import torch
 import torch.utils.data
 import torchvision
@@ -634,6 +638,58 @@ def _drop_unused_annotation_fields(coco_api: Any, include_masks: bool) -> None:
             annotation.pop("segmentation", None)
 
 
+class SerializedRecords:
+    """Read-only list whose items are pickled into one numpy byte buffer (Detectron2 ``DatasetFromList(serialize=True)``).
+
+    DataLoader workers are forked from the training process. Reading a Python object in a worker writes its reference
+    count, which copies the object's memory page into that worker, so per-image annotation dicts end up copied into
+    every worker over the epochs (pytorch/pytorch#13246). Unpickling from a numpy buffer writes nothing shared: all
+    workers keep sharing the one buffer, and each item comes back as fresh objects the caller may modify.
+
+    Args:
+        items: Picklable items, stored in order.
+
+    Examples:
+        >>> records = SerializedRecords([("a.jpg", [{"bbox": [0, 0, 1, 1]}]), ("b.jpg", [])])
+        >>> len(records), records[0], records[1]
+        (2, ('a.jpg', [{'bbox': [0, 0, 1, 1]}]), ('b.jpg', []))
+    """
+
+    def __init__(self, items: Sequence[Any]) -> None:
+        blobs = [np.frombuffer(pickle.dumps(item, protocol=pickle.HIGHEST_PROTOCOL), dtype=np.uint8) for item in items]
+        self._ends = np.cumsum([len(blob) for blob in blobs], dtype=np.int64)
+        self._buffer = np.concatenate(blobs) if blobs else np.zeros(0, dtype=np.uint8)
+
+    def __len__(self) -> int:
+        return len(self._ends)
+
+    def __getitem__(self, index: int) -> Any:
+        start = int(self._ends[index - 1]) if index > 0 else 0
+        return pickle.loads(memoryview(self._buffer[start : int(self._ends[index])]))
+
+
+def _drop_annotation_index(coco_api: Any) -> None:
+    """Empty the annotation index of a COCO object; images, categories and ``label2cat`` stay.
+
+    Examples:
+        >>> from pycocotools.coco import COCO
+        >>> coco = COCO()
+        >>> coco.dataset = {"images": [{"id": 1}], "annotations": [{"id": 5, "image_id": 1, "category_id": 1}],
+        ...                 "categories": [{"id": 1}]}
+        >>> coco.createIndex()  # doctest: +ELLIPSIS
+        creating index...
+        index created!
+        >>> _drop_annotation_index(coco)
+        >>> coco.anns, coco.getAnnIds(imgIds=[1]), sorted(coco.imgs), sorted(coco.cats)
+        ({}, [], [1], [1])
+    """
+    coco_api.anns = {}
+    coco_api.imgToAnns = defaultdict(list)
+    coco_api.catToImgs = defaultdict(list)
+    if isinstance(getattr(coco_api, "dataset", None), dict):
+        coco_api.dataset["annotations"] = []
+
+
 class CocoDetection(torchvision.datasets.CocoDetection):  # type: ignore[misc]
     """COCO detection dataset with optional sparse-to-contiguous category ID remapping.
 
@@ -679,6 +735,10 @@ class CocoDetection(torchvision.datasets.CocoDetection):  # type: ignore[misc]
         draft_size: Smallest source extent the transform pipeline can consume without upscaling, used to enable
             JPEG DCT-domain downscaling during decode (see :meth:`_decode_image`).  ``None`` (the default) decodes at
             full resolution.  :func:`draft_size_for_transforms` derives the value from the pipeline's scales.
+        serialize_annotations: Move each image's file name and annotations into a :class:`SerializedRecords` buffer
+            and empty the COCO annotation index (``self.coco`` keeps images, categories and ``label2cat``), so forked
+            DataLoader workers share the annotations instead of each copying them. Only for splits nothing evaluates
+            against: ``self.coco`` then has no ground truth. ``False`` (the default) keeps the COCO object intact.
     """
 
     def __init__(
@@ -692,6 +752,7 @@ class CocoDetection(torchvision.datasets.CocoDetection):  # type: ignore[misc]
         remap_category_ids: bool = False,
         cat2label: dict[int, int] | None = None,
         draft_size: int | None = None,
+        serialize_annotations: bool = False,
     ) -> None:
         if is_manifest(ann_file):
             # per-source files listed in annotations/train/manifest.json, merged into one COCO index
@@ -741,27 +802,36 @@ class CocoDetection(torchvision.datasets.CocoDetection):  # type: ignore[misc]
             cat2label=self.cat2label,
             num_keypoints_per_class=num_keypoints_per_class,
         )
+        self._records: SerializedRecords | None = None
+        if serialize_annotations:
+            self._records = SerializedRecords(
+                [(self.coco.imgs[image_id]["file_name"], self._load_target(image_id)) for image_id in self.ids]
+            )
+            _drop_annotation_index(self.coco)
+            gc.collect()
 
-    def _decode_image(self, image_id: int) -> tuple[Image.Image, tuple[float, float]]:
+    def _decode_image(self, file_name: str) -> tuple[Image.Image, tuple[float, float]]:
         """Decode one image through :func:`decode_image`, drafting when ``draft_size`` is set.
 
         Used instead of ``torchvision.datasets.CocoDetection._load_image``, which this class no longer calls, and
         deliberately not named the same: it returns a decode scale alongside the image.
 
         Args:
-            image_id: COCO image id.
+            file_name: Image path relative to ``self.root``.
 
         Returns:
             Decoded RGB image and its horizontal/vertical decode scales, both ``1.0`` when the decoder did not reduce.
         """
-        path = self.coco.loadImgs(image_id)[0]["file_name"]
-        pixels, scales = decode_image(Path(self.root) / path, self._draft_size)
+        pixels, scales = decode_image(Path(self.root) / file_name, self._draft_size)
         return Image.fromarray(pixels), scales
 
     def __getitem__(self, idx: int) -> tuple[Any, Any]:
         image_id = self.ids[idx]
-        img, (x_scale, y_scale) = self._decode_image(image_id)
-        annotations = self._load_target(image_id)
+        if self._records is None:
+            file_name, annotations = self.coco.loadImgs(image_id)[0]["file_name"], self._load_target(image_id)
+        else:
+            file_name, annotations = self._records[idx]
+        img, (x_scale, y_scale) = self._decode_image(file_name)
         if (x_scale, y_scale) != (1.0, 1.0):
             annotations = [scale_coco_annotation(annotation, x_scale, y_scale) for annotation in annotations]
         target = {"image_id": image_id, "annotations": annotations}
@@ -1551,6 +1621,10 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
             "unavailable; disabling GPU postprocess transforms and retaining CPU normalization."
         )
     gpu_postprocess = is_gpu_postprocess(resolved_augmentation_backend)
+    # Train annotations are only read by the DataLoader workers, unless train-split metrics evaluate against them.
+    serialize_annotations = image_set.split("_", maxsplit=1)[0] == "train" and not getattr(
+        args, "compute_train_metrics", False
+    )
     draft_size = draft_size_for_transforms(
         image_set,
         resolution,
@@ -1588,6 +1662,7 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
             # the other silently misaligns training supervision.
             remap_category_ids=include_keypoints,
             draft_size=draft_size,
+            serialize_annotations=serialize_annotations,
         )
     else:
         logger.info(f"Building COCO {image_set} dataset at resolution {resolution}")
@@ -1615,6 +1690,7 @@ def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
             # the other silently misaligns training supervision.
             remap_category_ids=include_keypoints,
             draft_size=draft_size,
+            serialize_annotations=serialize_annotations,
         )
     return dataset
 
@@ -1680,6 +1756,8 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
     # train but not in valid shift every later label index of that split. The keypoint path maps categories onto
     # schema slots instead of annotation coverage, so it keeps its own derivation.
     cat2label = None if split == "train" or include_keypoints else _train_split_cat2label(root)
+    # Train annotations are only read by the DataLoader workers, unless train-split metrics evaluate against them.
+    serialize_annotations = split == "train" and not getattr(args, "compute_train_metrics", False)
     draft_size = draft_size_for_transforms(
         image_set,
         resolution,
@@ -1715,6 +1793,7 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
             remap_category_ids=True,
             cat2label=cat2label,
             draft_size=draft_size,
+            serialize_annotations=serialize_annotations,
         )
     else:
         logger.info(f"Building Roboflow {image_set} dataset at resolution {resolution}")
@@ -1740,5 +1819,6 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> Coco
             remap_category_ids=True,
             cat2label=cat2label,
             draft_size=draft_size,
+            serialize_annotations=serialize_annotations,
         )
     return dataset
